@@ -24,8 +24,7 @@ stop_radicals = set("艹月氺水日木人手心")
 def decompose_practical(char, ids_dict, max_depth=10, current_depth=0):
     if current_depth > max_depth or char in ids_operators:
         return char
-        
-    # 【追加】ストップリストに含まれる部品なら、そこで分解を止める
+    
     if char in stop_radicals:
         return char
 
@@ -34,7 +33,6 @@ def decompose_practical(char, ids_dict, max_depth=10, current_depth=0):
         
     first_candidate = ids_dict[char].split(',')[0]
     
-    # 【追加】[G], [J] などのメタデータタグを正規表現で削除
     first_candidate = re.sub(r'\[.*?\]', '', first_candidate)
     
     full_decomposition = ""
