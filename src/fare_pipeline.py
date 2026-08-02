@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import pickle
 import re
 from collections import Counter
@@ -8,7 +9,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import torch
 
 
 STRUCTURE_SYMBOLS = ("⿰", "⿱", "⿲", "⿳", "⿴", "⿵", "⿶", "⿷", "⿸", "⿹", "⿺", "⿻")
@@ -34,6 +37,33 @@ class RenderedRadical:
     codepoint: str
     image_path: str
     renderable: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class RadicalFeatureRecord:
+    radical: str
+    codepoint: str
+    image_path: str
+    renderable: bool
+    feature: list[float]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class FareCodeRecord:
+    radical: str
+    codepoint: str
+    image_path: str
+    renderable: bool
+    feature: list[float]
+    projected: list[float]
+    fare_code: list[int]
+    source: str
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -212,3 +242,49 @@ def save_render_manifest(rendered: list[RenderedRadical], alien_radicals: list[s
     json_path = output_path.with_suffix(".json")
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def load_render_manifest(manifest_path: Path) -> dict:
+    with manifest_path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def load_rendered_radicals(manifest_path: Path) -> list[RenderedRadical]:
+    manifest = load_render_manifest(manifest_path)
+    rendered_items = manifest.get("rendered", [])
+    return [RenderedRadical(**item) for item in rendered_items]
+
+
+def image_to_tensor(image_path: Path, image_size: int = 96) -> torch.Tensor:
+    image = Image.open(image_path).convert("RGB").resize((image_size, image_size))
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    if array.ndim == 2:
+        array = np.expand_dims(array, axis=-1)
+        array = np.repeat(array, 3, axis=-1)
+    array = np.transpose(array, (2, 0, 1))
+    tensor = torch.from_numpy(array)
+    normalize = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+    return (tensor - normalize) / std
+
+
+def save_pickle_and_json(payload: object, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as handle:
+        pickle.dump(payload, handle)
+
+    json_path = output_path.with_suffix(".json")
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def set_reproducible_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_binary_code(values: np.ndarray) -> list[int]:
+    return [1 if value > 0 else -1 for value in values.tolist()]
