@@ -1,6 +1,0 @@
-tmp_resume_check\part0\0.jpg
-tmp_resume_check\part0\1.jpg
-tmp_resume_check\part1\0.jpg
-tmp_resume_check\part1\1.jpg
-tmp_resume_check\part2\0.jpg
-tmp_resume_check\part2\1.jpg
