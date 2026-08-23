@@ -16,3 +16,16 @@
   --device cuda
 ```
 
+[26/08/23] 大規模データセットで事前学習してファインチューニングする 
+```
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --codebook "outputs/final_codebook.pkl" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --checkpoint-path "outputs/260822_finetuning/finetuning_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260822_finetuning/pretrain_fare_model.pth" ^
+  --device cuda ^
+  --epochs 20 ^
+  --pretrain-epochs 5 ^
+  --batch-size 32
+```

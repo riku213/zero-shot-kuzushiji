@@ -35,7 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-path",
         default="outputs/best_fare_model.pth",
-        help="Path to save the best model checkpoint. Default: outputs/best_fare_model.pth",
+        help="Path to save the best fine-tuning checkpoint. Default: outputs/best_fare_model.pth",
+    )
+    parser.add_argument(
+        "--pretrain-checkpoint-path",
+        default="outputs/pretrain_best_fare_model.pth",
+        help="Path to save the best pretraining checkpoint. Default: outputs/pretrain_best_fare_model.pth",
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size for training and validation.")
@@ -45,6 +50,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--max-classes", type=int, default=None, help="Optional limit on the number of classes used for debugging.")
     parser.add_argument("--max-samples-per-class", type=int, default=None, help="Optional cap per class for quick validation.")
+    parser.add_argument(
+        "--pretrain-root",
+        default=None,
+        help="Optional root directory for a large handwritten-character pretraining dataset. The loader accepts flexible folder structures and only keeps classes present in the target CodeBook.",
+    )
+    parser.add_argument(
+        "--pretrain-epochs",
+        type=int,
+        default=1,
+        help="Number of pretraining epochs to run before fine-tuning on the kuzushiji dataset.",
+    )
+    parser.add_argument(
+        "--pretrain-max-classes",
+        type=int,
+        default=None,
+        help="Optional cap on pretraining classes for quick validation.",
+    )
+    parser.add_argument(
+        "--pretrain-max-samples-per-class",
+        type=int,
+        default=None,
+        help="Optional cap on pretraining samples per class.",
+    )
     return parser.parse_args()
 
 
@@ -121,11 +149,22 @@ def load_codebook(codebook_path: Path) -> dict[str, np.ndarray]:
     return converted
 
 
-def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
-    allowed_aliases: set[str] = set()
-    for key in codebook.keys():
-        allowed_aliases.update(unicode_aliases(key))
+def resolve_codebook_label(candidate: str, codebook: dict[str, np.ndarray]) -> str | None:
+    normalized = normalize_unicode_key(candidate)
+    if not normalized:
+        return None
 
+    if normalized in codebook:
+        return normalized
+
+    for class_key in codebook:
+        aliases = unicode_aliases(class_key)
+        if normalized in aliases:
+            return str(class_key)
+    return None
+
+
+def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
     class_to_index: dict[str, int] = {}
     sorted_codebook_keys = sorted(codebook.keys(), key=lambda value: str(value))
     for index, key in enumerate(sorted_codebook_keys):
@@ -137,43 +176,39 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
     if not data_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {data_root}")
 
-    for book_dir in sorted(data_root.iterdir(), key=lambda item: item.name):
-        if not book_dir.is_dir():
-            continue
-        characters_dir = book_dir / "characters"
-        if not characters_dir.is_dir():
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    for image_path in sorted(data_root.rglob("*")):
+        if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
             continue
 
-        for unicode_dir in sorted(characters_dir.iterdir(), key=lambda item: item.name):
-            if not unicode_dir.is_dir():
-                continue
-            directory_name = unicode_dir.name
-            for class_key in codebook.keys():
-                if directory_name in unicode_aliases(class_key):
-                    matched_key = str(class_key)
-                    break
-            else:
-                continue
+        candidate_names: list[str] = []
+        candidate_names.extend([image_path.stem, image_path.parent.name])
+        for parent in image_path.parents:
+            if parent == data_root:
+                break
+            candidate_names.append(parent.name)
 
-            files = sorted(
-                list(unicode_dir.glob("*.jpg"))
-                + list(unicode_dir.glob("*.jpeg"))
-                + list(unicode_dir.glob("*.png"))
-                + list(unicode_dir.glob("*.bmp"))
-            )
-            if not files:
-                continue
+        matched_key: str | None = None
+        for candidate in candidate_names:
+            resolved = resolve_codebook_label(candidate, codebook)
+            if resolved is not None:
+                matched_key = resolved
+                break
 
-            for image_path in files[: max_samples_per_class] if max_samples_per_class is not None else files:
-                sample_entries.append(
-                    {
-                        "book_id": book_dir.name,
-                        "unicode": matched_key,
-                        "label": class_to_index[matched_key],
-                        "image_path": str(image_path),
-                    }
-                )
-                class_samples[matched_key].append(sample_entries[-1])
+        if matched_key is None:
+            continue
+
+        if max_samples_per_class is not None and len(class_samples[matched_key]) >= max_samples_per_class:
+            continue
+
+        entry = {
+            "book_id": data_root.name,
+            "unicode": matched_key,
+            "label": class_to_index[matched_key],
+            "image_path": str(image_path),
+        }
+        sample_entries.append(entry)
+        class_samples[matched_key].append(entry)
 
     if not sample_entries:
         raise RuntimeError(f"No dataset samples were found under {data_root} for any CodeBook class.")
@@ -305,51 +340,24 @@ def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, d
     return mean_loss, accuracy
 
 
-def main() -> None:
-    args = parse_args()
-    set_reproducible_seed(args.seed)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = Path(args.checkpoint_path)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+def train_model_on_dataset(
+    model: nn.Module,
+    train_entries: list[dict[str, Any]],
+    val_entries: list[dict[str, Any]],
+    codebook_matrix: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    epochs: int,
+    checkpoint_path: Path,
+    class_to_index: dict[str, int],
+    seed: int,
+    verbose: bool = True,
+) -> tuple[float, float]:
+    train_dataset = CharacterImageDataset(train_entries, image_size=96)
+    val_dataset = CharacterImageDataset(val_entries, image_size=96)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    print(f"Training started: epochs={args.epochs}, batch_size={args.batch_size}, device={args.device}")
-    print(f"Checkpoint path: {checkpoint_path}")
-
-    codebook = load_codebook(Path(args.codebook))
-    if not codebook:
-        raise ValueError(f"No entries were loaded from {args.codebook}.")
-
-    class_to_index, entries = collect_class_samples(
-        Path(args.data_root),
-        codebook,
-        max_classes=args.max_classes,
-        max_samples_per_class=args.max_samples_per_class,
-    )
-
-    # The class names are the Unicode identifiers, and the index space is zero-based in the same order as the CodeBook.
-    if len(class_to_index) == 0:
-        raise ValueError("No valid CodeBook classes were found in the dataset.")
-
-    labels = [entry["label"] for entry in entries]
-    train_indices, val_indices = build_split(labels, args.train_ratio, args.seed)
-    if not train_indices or not val_indices:
-        raise ValueError("Training or validation split is empty; use a larger dataset or lower train_ratio.")
-
-    train_entries = [entries[idx] for idx in train_indices]
-    val_entries = [entries[idx] for idx in val_indices]
-
-    train_dataset = CharacterImageDataset(train_entries, image_size=args.image_size)
-    val_dataset = CharacterImageDataset(val_entries, image_size=args.image_size)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-
-    device = torch.device(args.device)
-    codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
-    codebook_matrix = codebook_matrix.to(device)
-
-    model = FareRecognitionModel(codebook_dim=codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
     optimizer = torch.optim.Adadelta(model.parameters(), lr=0.1, rho=0.95, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
 
@@ -357,7 +365,7 @@ def main() -> None:
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = -1
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
         seen = 0
@@ -379,7 +387,8 @@ def main() -> None:
         train_loss = running_loss / max(1, seen)
         val_loss, val_accuracy = evaluate(model, val_loader, codebook_matrix, device)
 
-        print(f"Epoch {epoch:02d}/{args.epochs:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_accuracy:.4f}")
+        if verbose:
+            print(f"Epoch {epoch:02d}/{epochs:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_accuracy:.4f}")
 
         if val_accuracy > best_accuracy:
             best_accuracy = val_accuracy
@@ -395,10 +404,110 @@ def main() -> None:
                 },
                 checkpoint_path,
             )
-            print(f"Saved best model checkpoint to {checkpoint_path}")
+            if verbose:
+                print(f"Saved best model checkpoint to {checkpoint_path}")
 
     if best_state_dict is None:
         raise RuntimeError("No model checkpoint was saved during training.")
+
+    return best_accuracy, best_epoch
+
+
+def main() -> None:
+    args = parse_args()
+    set_reproducible_seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = Path(args.checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    pretrain_checkpoint_path = Path(args.pretrain_checkpoint_path)
+    pretrain_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Training started: epochs={args.epochs}, batch_size={args.batch_size}, device={args.device}")
+    if args.pretrain_root:
+        print(f"Pretraining dataset: {args.pretrain_root}")
+    print(f"Fine-tuning checkpoint path: {checkpoint_path}")
+    if args.pretrain_root:
+        print(f"Pretraining checkpoint path: {pretrain_checkpoint_path}")
+
+    codebook = load_codebook(Path(args.codebook))
+    if not codebook:
+        raise ValueError(f"No entries were loaded from {args.codebook}.")
+
+    device = torch.device(args.device)
+    if args.pretrain_root:
+        pretrain_root = Path(args.pretrain_root)
+        pretrain_class_to_index, pretrain_entries = collect_class_samples(
+            pretrain_root,
+            codebook,
+            max_classes=args.pretrain_max_classes,
+            max_samples_per_class=args.pretrain_max_samples_per_class,
+        )
+        if pretrain_entries:
+            print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
+            pretrain_labels = [entry["label"] for entry in pretrain_entries]
+            pretrain_train_idx, pretrain_val_idx = build_split(pretrain_labels, args.train_ratio, args.seed)
+            pretrain_train_entries = [pretrain_entries[idx] for idx in pretrain_train_idx]
+            pretrain_val_entries = [pretrain_entries[idx] for idx in pretrain_val_idx]
+
+            pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
+            pretrain_codebook_matrix = torch.stack(pretrain_codebook_vectors).to(device)
+            pretrain_model = FareRecognitionModel(codebook_dim=pretrain_codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
+            best_pre_acc, best_pre_epoch = train_model_on_dataset(
+                model=pretrain_model,
+                train_entries=pretrain_train_entries,
+                val_entries=pretrain_val_entries,
+                codebook_matrix=pretrain_codebook_matrix,
+                device=device,
+                batch_size=args.batch_size,
+                epochs=args.pretrain_epochs,
+                checkpoint_path=pretrain_checkpoint_path,
+                class_to_index=pretrain_class_to_index,
+                seed=args.seed,
+                verbose=True,
+            )
+            print(f"Pretraining complete. Best validation accuracy on pretraining data: {best_pre_acc:.4f} at epoch {best_pre_epoch}.")
+        else:
+            print(f"No pretraining samples found under {pretrain_root}. Continuing without pretraining.")
+
+    class_to_index, entries = collect_class_samples(
+        Path(args.data_root),
+        codebook,
+        max_classes=args.max_classes,
+        max_samples_per_class=args.max_samples_per_class,
+    )
+
+    if len(class_to_index) == 0:
+        raise ValueError("No valid CodeBook classes were found in the dataset.")
+
+    labels = [entry["label"] for entry in entries]
+    train_indices, val_indices = build_split(labels, args.train_ratio, args.seed)
+    if not train_indices or not val_indices:
+        raise ValueError("Training or validation split is empty; use a larger dataset or lower train_ratio.")
+
+    train_entries = [entries[idx] for idx in train_indices]
+    val_entries = [entries[idx] for idx in val_indices]
+
+    codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
+    codebook_matrix = codebook_matrix.to(device)
+
+    model = FareRecognitionModel(codebook_dim=codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
+    if args.pretrain_root and 'pretrain_model' in locals():
+        model.load_state_dict(pretrain_model.state_dict())
+
+    best_accuracy, best_epoch = train_model_on_dataset(
+        model=model,
+        train_entries=train_entries,
+        val_entries=val_entries,
+        codebook_matrix=codebook_matrix,
+        device=device,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        checkpoint_path=checkpoint_path,
+        class_to_index=class_to_index,
+        seed=args.seed,
+        verbose=True,
+    )
 
     print(f"Training complete. Best validation accuracy: {best_accuracy:.4f} at epoch {best_epoch}.")
     print(f"Best model saved to {checkpoint_path}")
