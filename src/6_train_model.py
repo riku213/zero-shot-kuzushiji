@@ -13,6 +13,7 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models
+from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,7 +178,11 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
         raise FileNotFoundError(f"Dataset root not found: {data_root}")
 
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
-    for image_path in sorted(data_root.rglob("*")):
+    # Iterate recursively with a progress indicator; large datasets (CASIA) can take long to scan.
+    iterator = data_root.rglob("*")
+    scanned = 0
+    for image_path in tqdm(iterator, desc=f"Scanning {data_root}", unit="path", leave=False):
+        scanned += 1
         if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
             continue
 
@@ -324,7 +329,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, d
     criterion = nn.CrossEntropyLoss()
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
             binary_code = model(images)
@@ -370,7 +375,7 @@ def train_model_on_dataset(
         running_loss = 0.0
         seen = 0
 
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"Train E{epoch}", leave=False):
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
