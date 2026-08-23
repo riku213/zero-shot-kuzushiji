@@ -6,6 +6,7 @@ import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+import os
 
 import numpy as np
 import torch
@@ -42,6 +43,21 @@ def parse_args() -> argparse.Namespace:
         "--pretrain-checkpoint-path",
         default="outputs/pretrain_best_fare_model.pth",
         help="Path to save the best pretraining checkpoint. Default: outputs/pretrain_best_fare_model.pth",
+    )
+    parser.add_argument(
+        "--manifest-path",
+        default="outputs/manifests/main_manifest.txt",
+        help="Optional path to a manifest file (one image path per line) for the main dataset.",
+    )
+    parser.add_argument(
+        "--pretrain-manifest-path",
+        default="outputs/manifests/pretrain_manifest.txt",
+        help="Optional path to a manifest file (one image path per line) for the pretraining dataset.",
+    )
+    parser.add_argument(
+        "--build-manifest",
+        action="store_true",
+        help="If set, build manifest files (if manifest paths supplied) before scanning datasets.",
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size for training and validation.")
@@ -165,7 +181,43 @@ def resolve_codebook_label(candidate: str, codebook: dict[str, np.ndarray]) -> s
     return None
 
 
-def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
+def build_manifest(root: Path, manifest_path: Path, resume: bool = True) -> int:
+    """Build a manifest file listing all image files under root.
+
+    If resume is True and manifest_path exists, existing entries are respected and new
+    files are appended. Returns total number of entries in the final manifest.
+    """
+    image_ext = (".png", ".jpg", ".jpeg", ".bmp")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: set[str] = set()
+    if resume and manifest_path.exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    existing.add(line.strip())
+        except Exception:
+            existing = set()
+
+    count = len(existing)
+
+    # Open in append mode to add missing entries
+    with manifest_path.open("a", encoding="utf-8") as fh:
+        for dp, _, fns in os.walk(root):
+            for fn in fns:
+                if not fn.lower().endswith(image_ext):
+                    continue
+                full = os.path.join(dp, fn)
+                if full in existing:
+                    continue
+                fh.write(full + "\n")
+                existing.add(full)
+                count += 1
+
+    return count
+
+
+def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None, manifest_path: Path | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
     class_to_index: dict[str, int] = {}
     sorted_codebook_keys = sorted(codebook.keys(), key=lambda value: str(value))
     for index, key in enumerate(sorted_codebook_keys):
@@ -178,11 +230,23 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
         raise FileNotFoundError(f"Dataset root not found: {data_root}")
 
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
-    # Iterate recursively with a progress indicator; large datasets (CASIA) can take long to scan.
-    iterator = data_root.rglob("*")
-    scanned = 0
-    for image_path in tqdm(iterator, desc=f"Scanning {data_root}", unit="path", leave=False):
-        scanned += 1
+
+    def iter_paths_from_manifest(path: Path):
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                p = Path(line.strip())
+                if p and p.suffix.lower() in image_extensions:
+                    yield p
+
+    if manifest_path is not None and manifest_path.exists():
+        iterator = iter_paths_from_manifest(manifest_path)
+        iterator = tqdm(iterator, desc=f"Reading manifest {manifest_path.name}", unit="path", leave=False)
+    else:
+        # Iterate recursively with a progress indicator; large datasets (CASIA) can take long to scan.
+        iterator = data_root.rglob("*")
+        iterator = tqdm(iterator, desc=f"Scanning {data_root}", unit="path", leave=False)
+
+    for image_path in iterator:
         if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
             continue
 
@@ -360,8 +424,10 @@ def train_model_on_dataset(
 ) -> tuple[float, float]:
     train_dataset = CharacterImageDataset(train_entries, image_size=96)
     val_dataset = CharacterImageDataset(val_entries, image_size=96)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    num_workers = 0
+    pin_memory = True if device.type == "cuda" else False
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     optimizer = torch.optim.Adadelta(model.parameters(), lr=0.1, rho=0.95, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
@@ -427,6 +493,19 @@ def main() -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     pretrain_checkpoint_path = Path(args.pretrain_checkpoint_path)
     pretrain_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(args.manifest_path) if getattr(args, "manifest_path", None) else None
+    pretrain_manifest_path = Path(args.pretrain_manifest_path) if getattr(args, "pretrain_manifest_path", None) else None
+
+    # Optionally build manifest files before scanning (can be faster than repeated rglob)
+    if args.build_manifest:
+        if pretrain_manifest_path and args.pretrain_root:
+            print(f"Building pretrain manifest {pretrain_manifest_path} from {args.pretrain_root}...")
+            n = build_manifest(Path(args.pretrain_root), pretrain_manifest_path)
+            print(f"Wrote {n} entries to {pretrain_manifest_path}")
+        if manifest_path:
+            print(f"Building main manifest {manifest_path} from {args.data_root}...")
+            n = build_manifest(Path(args.data_root), manifest_path)
+            print(f"Wrote {n} entries to {manifest_path}")
 
     print(f"Training started: epochs={args.epochs}, batch_size={args.batch_size}, device={args.device}")
     if args.pretrain_root:
@@ -447,6 +526,7 @@ def main() -> None:
             codebook,
             max_classes=args.pretrain_max_classes,
             max_samples_per_class=args.pretrain_max_samples_per_class,
+            manifest_path=pretrain_manifest_path,
         )
         if pretrain_entries:
             print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
@@ -480,6 +560,7 @@ def main() -> None:
         codebook,
         max_classes=args.max_classes,
         max_samples_per_class=args.max_samples_per_class,
+        manifest_path=manifest_path,
     )
 
     if len(class_to_index) == 0:

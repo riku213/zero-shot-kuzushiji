@@ -30,3 +30,28 @@ python src/6_train_model.py ^
   --batch-size 32
 ```
 
+[26/08/24] manifestで大規模データセットのスキャンを次回以降高速化する
+まずmanifestを作成する
+
+```
+python src/6_train_model.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --build-manifest
+```
+
+作成したmanifestで高速に学習を進める
+```
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --codebook "outputs/final_codebook.pkl" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --checkpoint-path "outputs/260822_finetuning/finetuning_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260822_finetuning/pretrain_fare_model.pth" ^
+  --device cuda ^
+  --epochs 20^
+  --pretrain-epochs 2 ^
+  --batch-size 32
+```
