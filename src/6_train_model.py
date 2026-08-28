@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 import os
+import re
 
 import numpy as np
 import torch
@@ -171,13 +172,64 @@ def resolve_codebook_label(candidate: str, codebook: dict[str, np.ndarray]) -> s
     if not normalized:
         return None
 
+    # direct match
     if normalized in codebook:
         return normalized
 
+    # class-key aliases (U+XXXX or character)
     for class_key in codebook:
         aliases = unicode_aliases(class_key)
         if normalized in aliases:
             return str(class_key)
+
+    # Heuristics for CASIA-like numeric or hex labels:
+    # - decimal codepoint (e.g. '19968')
+    # - hex codepoint present in names (e.g. '4E00')
+    # - mixed prefixes/suffixes containing digits/hex
+    try:
+        if normalized.isdigit():
+            cp = int(normalized, 10)
+            if 0 <= cp <= 0x10FFFF:
+                candidate_char = chr(cp)
+                # check direct char and U+XXXX form
+                if candidate_char in codebook:
+                    return candidate_char
+                ukey = f"U+{cp:04X}".upper()
+                if ukey in codebook:
+                    return ukey
+    except Exception:
+        pass
+
+    # search for a decimal substring
+    m = re.search(r"(\d{3,6})", normalized)
+    if m:
+        try:
+            cp = int(m.group(1), 10)
+            if 0 <= cp <= 0x10FFFF:
+                candidate_char = chr(cp)
+                if candidate_char in codebook:
+                    return candidate_char
+                ukey = f"U+{cp:04X}".upper()
+                if ukey in codebook:
+                    return ukey
+        except Exception:
+            pass
+
+    # search for a hex substring
+    m2 = re.search(r"([0-9A-Fa-f]{4,6})", normalized)
+    if m2:
+        try:
+            cp = int(m2.group(1), 16)
+            if 0 <= cp <= 0x10FFFF:
+                candidate_char = chr(cp)
+                if candidate_char in codebook:
+                    return candidate_char
+                ukey = f"U+{cp:04X}".upper()
+                if ukey in codebook:
+                    return ukey
+        except Exception:
+            pass
+
     return None
 
 
@@ -217,7 +269,7 @@ def build_manifest(root: Path, manifest_path: Path, resume: bool = True) -> int:
     return count
 
 
-def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None, manifest_path: Path | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
+def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_classes: int | None = None, max_samples_per_class: int | None = None, manifest_path: Path | None = None, allow_empty: bool = False) -> tuple[dict[str, int], list[dict[str, Any]]]:
     class_to_index: dict[str, int] = {}
     sorted_codebook_keys = sorted(codebook.keys(), key=lambda value: str(value))
     for index, key in enumerate(sorted_codebook_keys):
@@ -257,6 +309,27 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
                 break
             candidate_names.append(parent.name)
 
+        # Expand candidate tokens to handle CASIA-style filenames with numbers and delimiters.
+        expanded_candidates: list[str] = []
+        for cand in candidate_names:
+            if not cand:
+                continue
+            # strip trailing numeric suffixes like '_123' or ' 123'
+            no_num = re.sub(r"[ _\-]*\d+$", "", cand)
+            # split on common delimiters (middle dot, underscores, hyphens, spaces, dots)
+            parts = re.split(r"[\.・_\- ]+", no_num)
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                expanded_candidates.append(part)
+                # also try individual characters (common for CJK labels)
+                for ch in part:
+                    expanded_candidates.append(ch)
+
+        # ensure original candidates are considered first
+        candidate_names = candidate_names + expanded_candidates
+
         matched_key: str | None = None
         for candidate in candidate_names:
             resolved = resolve_codebook_label(candidate, codebook)
@@ -280,6 +353,8 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
         class_samples[matched_key].append(entry)
 
     if not sample_entries:
+        if allow_empty:
+            return {}, []
         raise RuntimeError(f"No dataset samples were found under {data_root} for any CodeBook class.")
 
     filtered_classes = sorted(class_samples.keys(), key=lambda item: str(item))
@@ -527,6 +602,7 @@ def main() -> None:
             max_classes=args.pretrain_max_classes,
             max_samples_per_class=args.pretrain_max_samples_per_class,
             manifest_path=pretrain_manifest_path,
+            allow_empty=True,
         )
         if pretrain_entries:
             print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
