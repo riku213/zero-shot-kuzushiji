@@ -11,7 +11,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--pretrain-root', required=True)
-    parser.add_argument('--codebook', default='outputs/final_codebook.pkl')
+    parser.add_argument('--codebook', default='outputs/260828_codebook/final_codebook.pkl')
     parser.add_argument('--pretrain-manifest', default=None)
     parser.add_argument('--max-classes', type=int, default=100)
     parser.add_argument('--max-samples', type=int, default=20)

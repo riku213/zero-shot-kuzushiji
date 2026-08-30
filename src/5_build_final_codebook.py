@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="outputs/final_codebook.pkl",
+        default="outputs/260828_codebook/final_codebook.pkl",
         help="Output path for the final Unicode codebook.",
     )
     return parser.parse_args()
@@ -108,19 +108,38 @@ def dataset_has_class(dataset_root: Path, unicode_key: str) -> bool:
     return False
 
 
+def collect_dataset_classes(dataset_root: Path) -> set[str]:
+    available_classes: set[str] = set()
+    if not dataset_root.exists():
+        return available_classes
+
+    for book_dir in dataset_root.iterdir():
+        if not book_dir.is_dir():
+            continue
+        character_root = book_dir / "characters"
+        if not character_root.exists():
+            continue
+        for class_dir in character_root.iterdir():
+            if class_dir.is_dir():
+                available_classes.add(unicode_key_from_character(class_dir.name))
+
+    return available_classes
+
+
 def build_final_codebook(ids_files: list[str], radical_codes_path: Path, dataset_root: Path | None = None) -> dict[str, list[int]]:
     radical_to_code = load_radical_to_code(radical_codes_path)
     code_dim = max(len(code) for code in radical_to_code.values()) if radical_to_code else 64
 
     merged = merge_ids_entries(read_ids_entries([Path(path) for path in ids_files]))
     codebook: dict[str, list[int]] = {}
+    available_classes = collect_dataset_classes(dataset_root) if dataset_root is not None else set()
 
     for character, expression in merged.items():
         key = unicode_key_from_character(character)
         if not key:
             continue
 
-        if dataset_root is not None and not dataset_has_class(dataset_root, key):
+        if dataset_root is not None and available_classes and key not in available_classes:
             continue
 
         vector = expression_to_vector(expression, radical_to_code, code_dim)
@@ -148,6 +167,7 @@ def main() -> None:
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(final_codebook, handle, ensure_ascii=False, indent=2)
 
+    print(f"Loaded IDS entries from {len(args.ids_files)} file(s).")
     print(f"Built final_codebook with {len(final_codebook)} Unicode classes.")
     print(f"Saved to {output_path.resolve()}")
 

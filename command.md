@@ -7,7 +7,7 @@
 ```
 .\.venv\Scripts\python.exe src\6_train_model.py ^
   --data-root "..\kuzushiji-recognition\char_sep_datas" ^
-  --codebook "outputs\final_codebook.pkl" ^
+  --codebook "outputs\260828_codebook\final_codebook.pkl" ^
   --output-dir "outputs" ^
   --checkpoint-path "outputs\260822_first_trial.pth" ^
   --epochs 20 ^
@@ -20,7 +20,7 @@
 ```
 python src/6_train_model.py ^
   --data-root "../kuzushiji-recognition/char_sep_datas" ^
-  --codebook "outputs/final_codebook.pkl" ^
+  --codebook "outputs/260828_codebook/final_codebook.pkl" ^
   --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
   --checkpoint-path "outputs/260822_finetuning/finetuning_fare_model.pth" ^
   --pretrain-checkpoint-path "outputs/260822_finetuning/pretrain_fare_model.pth" ^
@@ -44,7 +44,7 @@ python src/6_train_model.py ^
 ```
 python src/6_train_model.py ^
   --data-root "../kuzushiji-recognition/char_sep_datas" ^
-  --codebook "outputs/final_codebook.pkl" ^
+  --codebook "outputs/260828_codebook/final_codebook.pkl" ^
   --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
   --manifest-path "outputs/manifests/main_manifest.txt" ^
   --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
@@ -54,4 +54,39 @@ python src/6_train_model.py ^
   --epochs 20^
   --pretrain-epochs 2 ^
   --batch-size 32
+```
+
+事前学習とファインチューニングを実行
+＜テスト＞
+```
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --checkpoint-path "outputs/260828_finetuning/finetuning_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260828_finetuning/pretrain_fare_model.pth" ^
+  --epochs 1 ^
+  --pretrain-epochs 1 ^
+  --pretrain-max-classes 100 ^
+  --pretrain-max-samples-per-class 20 ^
+  --max-classes 100 ^
+  --max-samples-per-class 20 ^
+  --batch-size 16 ^
+  --device cpu
+```
+
+＜本番＞
+```
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --checkpoint-path "outputs/260828_finetuning/finetuning_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260828_finetuning/pretrain_fare_model.pth" ^
+  --epochs 20 ^
+  --pretrain-epochs 5 ^
+  --batch-size 32 ^
+  --device cuda
 ```

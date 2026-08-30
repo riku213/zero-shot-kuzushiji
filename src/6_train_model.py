@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--codebook",
-        default="outputs/final_codebook.pkl",
+        default="outputs/260828_codebook/final_codebook.pkl",
         help="Pickle file containing the final CodeBook mapping Unicode class -> code vector.",
     )
     parser.add_argument(
