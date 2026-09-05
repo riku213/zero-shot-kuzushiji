@@ -90,3 +90,30 @@ python src/6_train_model.py ^
   --batch-size 32 ^
   --device cuda
 ```
+
+<Char_sep_dataにある文字だけで学習しようとするとデータが足りなすぎるので，CASIAデータセットにある文字種のcode bookも作成>
+```
+python src/5_build_final_codebook.py ^
+  --ids-files dataset/ids_text/ids.txt dataset/ids_text/ids-cdp.txt ^
+  --radical-codes outputs/radical_codes.pkl ^
+  --dataset-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --output outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl
+```
+↑なんかうまくいかなかった
+codebook作成
+```
+python src/5_build_final_codebook.py ^
+  --ids-files dataset/ids_text/ids.txt dataset/ids_text/ids-cdp.txt ^
+  --radical-codes outputs/radical_codes.pkl ^
+  --dataset-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --output outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl
+```
+PretrainManifest作成
+```
+python src/6_train_model.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --build-manifest
+```
