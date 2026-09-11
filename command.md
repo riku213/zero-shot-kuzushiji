@@ -117,3 +117,22 @@ python src/6_train_model.py ^
   --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
   --build-manifest
 ```
+
+[26/09/05] CASIA pretrain の予測結果と seen / unseen 評価をレポートとして出力
+```bash
+python tools/export_pretrain_results.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --reference-codebook "outputs/260828_codebook/final_codebook.pkl" ^
+  --prediction-codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --checkpoint-path "outputs/pretrain_best_fare_model.pth" ^
+  --output-dir "outputs/260901_codebook_CASIA/results" ^
+  --sample-count 100 ^
+  --train-ratio 0.8 ^
+  --batch-size 16 ^
+  --chunk-size 4096 ^
+  --device cuda
+```
+
+出力されるテキストは、`image_path` / `fare_code` / `predicted_unicode` / `predicted_char` / `true_unicode` / `true_char` / `group` の列を持つ。
+`group` は `seen` か `unseen` で、seen は学習済みクラスからのホールドアウト、unseen は学習に含まれないクラスを表す。
