@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -231,7 +231,26 @@ def main() -> None:
         if not entries:
             return
 
-        dataset = ImageBatchDataset(entries, image_size=96)
+        # Pre-validate images to avoid crashing DataLoader on corrupted files.
+        valid_entries: list[dict[str, Any]] = []
+        skipped_paths: list[str] = []
+        for e in entries:
+            image_path = Path(e["image_path"])
+            try:
+                # verify header only (fast) and close immediately
+                with Image.open(image_path) as img:
+                    img.verify()
+                valid_entries.append(e)
+            except (UnidentifiedImageError, OSError) as ex:
+                skipped_paths.append(str(image_path))
+
+        if skipped_paths:
+            print(f"Skipped {len(skipped_paths)} unreadable images (first: {skipped_paths[0]})")
+
+        if not valid_entries:
+            return
+
+        dataset = ImageBatchDataset(valid_entries, image_size=96)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
         with torch.no_grad():
