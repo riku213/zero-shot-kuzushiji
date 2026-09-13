@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import random
@@ -107,6 +108,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on pretraining samples per class.",
     )
+    parser.add_argument(
+        "--pretrain-train-class-ratio",
+        type=float,
+        default=0.8,
+        help="Ratio of pretraining classes to use as training classes (remaining classes become unseen test classes).",
+    )
+    parser.add_argument(
+        "--pretrain-seen-train-ratio",
+        type=float,
+        default=0.8,
+        help="Within training classes, ratio of samples used for training (remaining are seen test samples).",
+    )
+    parser.add_argument(
+        "--pretrain-split-manifest-train",
+        default="outputs/260913_redefine_train_data/pretrain_train_manifest.txt",
+        help="Output manifest path for pretraining train samples.",
+    )
+    parser.add_argument(
+        "--pretrain-split-manifest-seen-test",
+        default="outputs/260913_redefine_train_data/pretrain_seen_test_manifest.txt",
+        help="Output manifest path for pretraining seen test samples.",
+    )
+    parser.add_argument(
+        "--pretrain-split-manifest-unseen-test",
+        default="outputs/260913_redefine_train_data/pretrain_unseen_test_manifest.txt",
+        help="Output manifest path for pretraining unseen test samples.",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +168,64 @@ def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: tor
         for key, value in list(state.items()):
             if torch.is_tensor(value):
                 state[key] = value.to(device)
+
+
+def stable_value(seed: int, *parts: str) -> float:
+    digest = hashlib.sha1("|".join([str(seed), *parts]).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def is_valid_unicode_codebook_key(key: str) -> bool:
+    normalized = normalize_unicode_key(key)
+    if re.fullmatch(r"U\+[0-9A-F]{4,6}", normalized):
+        return True
+    return len(normalized) == 1 and not normalized.isdigit()
+
+
+def is_noise_candidate_token(token: str) -> bool:
+    text = token.strip()
+    if not text:
+        return True
+    low = text.lower()
+    if low in {"train", "test", "characters", "casia-hwdb", "casia-hwdb_train", "casia-hwdb_test"}:
+        return True
+    if text.isdigit():
+        return True
+    return False
+
+
+def extract_pretrain_candidate_names(image_path: Path) -> list[str]:
+    candidates: list[str] = []
+
+    parent_name = image_path.parent.name.strip()
+    if parent_name and not is_noise_candidate_token(parent_name):
+        candidates.append(parent_name)
+
+    stem = image_path.stem.strip()
+    if stem and not stem.isdigit():
+        parts = re.split(r"[\.・_\- ]+", stem)
+        for part in parts:
+            part = part.strip()
+            if not part or is_noise_candidate_token(part):
+                continue
+            candidates.append(part)
+
+    return candidates
+
+
+def resolve_pretrain_true_label(image_path: Path, codebook: dict[str, np.ndarray], allowed_keys: set[str]) -> str | None:
+    for candidate in extract_pretrain_candidate_names(image_path):
+        resolved = resolve_codebook_label(candidate, codebook)
+        if resolved is not None and resolved in allowed_keys:
+            return resolved
+    return None
+
+
+def write_manifest(entries: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(f"{entry['image_path']}\n")
 
 
 def normalize_unicode_key(value: Any) -> str:
@@ -411,6 +497,166 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
             final_entries.append(final_entry)
 
     return final_class_to_index, final_entries
+
+
+def collect_pretrain_entries_with_redefined_split(
+    data_root: Path,
+    codebook: dict[str, np.ndarray],
+    seed: int,
+    train_class_ratio: float,
+    seen_train_ratio: float,
+    max_classes: int | None = None,
+    max_samples_per_class: int | None = None,
+    manifest_path: Path | None = None,
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    if not data_root.exists():
+        raise FileNotFoundError(f"Dataset root not found: {data_root}")
+    if not 0.0 < train_class_ratio < 1.0:
+        raise ValueError("pretrain_train_class_ratio must be between 0 and 1.")
+    if not 0.0 < seen_train_ratio < 1.0:
+        raise ValueError("pretrain_seen_train_ratio must be between 0 and 1.")
+
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    allowed_keys = {str(key) for key in codebook if is_valid_unicode_codebook_key(str(key))}
+    class_samples: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def iter_paths_from_manifest(path: Path):
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                p = Path(line.strip())
+                if p and p.suffix.lower() in image_extensions:
+                    yield p
+
+    iterator = None
+    if manifest_path is not None and manifest_path.exists():
+        iterator = iter_paths_from_manifest(manifest_path)
+        iterator = tqdm(iterator, desc=f"Reading manifest {manifest_path.name}", unit="img")
+    else:
+        iterator = data_root.rglob("*")
+        iterator = tqdm(iterator, desc=f"Scanning {data_root}", unit="path")
+
+    total_images = 0
+    unresolved_images = 0
+    invalid_label_images = 0
+
+    for image_path in iterator:
+        if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
+            continue
+        total_images += 1
+
+        resolved = resolve_pretrain_true_label(image_path, codebook, allowed_keys)
+        if resolved is None:
+            unresolved_images += 1
+            continue
+
+        if resolved not in allowed_keys:
+            invalid_label_images += 1
+            continue
+
+        if max_samples_per_class is not None and len(class_samples[resolved]) >= max_samples_per_class:
+            continue
+
+        class_samples[resolved].append(
+            {
+                "book_id": data_root.name,
+                "unicode": resolved,
+                "image_path": str(image_path),
+            }
+        )
+
+    classes = sorted(class_samples.keys(), key=lambda item: str(item))
+    if max_classes is not None:
+        classes = classes[:max_classes]
+
+    if not classes:
+        return {}, [], [], {
+            "total_images": total_images,
+            "resolved_images": 0,
+            "unresolved_images": unresolved_images,
+            "invalid_label_images": invalid_label_images,
+            "train_classes": 0,
+            "unseen_classes": 0,
+            "seen_test_classes": 0,
+            "train_samples": 0,
+            "seen_test_samples": 0,
+            "unseen_test_samples": 0,
+        }
+
+    eligible_seen_classes = [cls for cls in classes if len(class_samples[cls]) >= 2]
+    forced_unseen_classes = [cls for cls in classes if len(class_samples[cls]) < 2]
+
+    train_class_set: set[str] = set()
+    unseen_class_set: set[str] = set(forced_unseen_classes)
+    for cls in eligible_seen_classes:
+        if stable_value(seed, "pretrain-class", cls) < train_class_ratio:
+            train_class_set.add(cls)
+        else:
+            unseen_class_set.add(cls)
+
+    if eligible_seen_classes and not train_class_set:
+        train_class_set.add(eligible_seen_classes[0])
+        unseen_class_set.discard(eligible_seen_classes[0])
+    if eligible_seen_classes and not (unseen_class_set - set(forced_unseen_classes)) and len(eligible_seen_classes) > 1:
+        moved = sorted(train_class_set)[-1]
+        train_class_set.discard(moved)
+        unseen_class_set.add(moved)
+
+    all_split_classes = sorted(train_class_set | unseen_class_set, key=lambda item: str(item))
+    class_to_index = {name: idx for idx, name in enumerate(all_split_classes)}
+
+    train_entries: list[dict[str, Any]] = []
+    seen_test_entries: list[dict[str, Any]] = []
+    unseen_test_entries: list[dict[str, Any]] = []
+
+    for cls in tqdm(all_split_classes, desc="Building split", unit="class"):
+        cls_entries = class_samples[cls]
+        if cls in unseen_class_set:
+            for entry in cls_entries:
+                item = dict(entry)
+                item["label"] = class_to_index[cls]
+                item["split"] = "unseen_test"
+                unseen_test_entries.append(item)
+            continue
+
+        local_train: list[dict[str, Any]] = []
+        local_seen_test: list[dict[str, Any]] = []
+        for entry in cls_entries:
+            if stable_value(seed, "pretrain-sample", cls, entry["image_path"]) < seen_train_ratio:
+                local_train.append(entry)
+            else:
+                local_seen_test.append(entry)
+
+        if not local_seen_test and len(local_train) > 1:
+            local_seen_test.append(local_train.pop())
+        if not local_train and local_seen_test:
+            local_train.append(local_seen_test.pop())
+
+        for entry in local_train:
+            item = dict(entry)
+            item["label"] = class_to_index[cls]
+            item["split"] = "train"
+            train_entries.append(item)
+        for entry in local_seen_test:
+            item = dict(entry)
+            item["label"] = class_to_index[cls]
+            item["split"] = "seen_test"
+            seen_test_entries.append(item)
+
+    val_entries = seen_test_entries + unseen_test_entries
+    split_summary = {
+        "total_images": total_images,
+        "resolved_images": sum(len(class_samples[c]) for c in all_split_classes),
+        "unresolved_images": unresolved_images,
+        "invalid_label_images": invalid_label_images,
+        "train_classes": len(train_class_set),
+        "seen_test_classes": len({entry["unicode"] for entry in seen_test_entries}),
+        "unseen_classes": len(unseen_class_set),
+        "train_samples": len(train_entries),
+        "seen_test_samples": len(seen_test_entries),
+        "unseen_test_samples": len(unseen_test_entries),
+    }
+
+    return class_to_index, train_entries, val_entries, split_summary
 
 
 class CharacterImageDataset(Dataset):
@@ -689,26 +935,28 @@ def main() -> None:
     device = torch.device(args.device)
     if args.pretrain_root:
         pretrain_root = Path(args.pretrain_root)
-        pretrain_class_to_index, pretrain_entries = collect_class_samples(
+        pretrain_class_to_index, pretrain_train_entries, pretrain_val_entries, pretrain_split_summary = collect_pretrain_entries_with_redefined_split(
             pretrain_root,
             codebook,
+            seed=args.seed,
+            train_class_ratio=args.pretrain_train_class_ratio,
+            seen_train_ratio=args.pretrain_seen_train_ratio,
             max_classes=args.pretrain_max_classes,
             max_samples_per_class=args.pretrain_max_samples_per_class,
             manifest_path=pretrain_manifest_path,
-            allow_empty=True,
         )
-        if pretrain_entries:
-            pretrain_sample_summary = summarize_entries(pretrain_entries)
+        if pretrain_train_entries or pretrain_val_entries:
+            write_manifest(pretrain_train_entries, Path(args.pretrain_split_manifest_train))
+            write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "seen_test"], Path(args.pretrain_split_manifest_seen_test))
+            write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "unseen_test"], Path(args.pretrain_split_manifest_unseen_test))
+
             print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
-            pretrain_labels = [entry["label"] for entry in pretrain_entries]
-            pretrain_train_idx, pretrain_val_idx = build_split(pretrain_labels, args.train_ratio, args.seed)
-            pretrain_train_entries = [pretrain_entries[idx] for idx in pretrain_train_idx]
-            pretrain_val_entries = [pretrain_entries[idx] for idx in pretrain_val_idx]
             print(
-                "Pretrain split summary: "
-                f"classes={pretrain_sample_summary['classes']} samples={pretrain_sample_summary['samples']} | "
-                f"train_classes={count_unique_classes(pretrain_train_entries)} train_samples={len(pretrain_train_entries)} | "
-                f"val_classes={count_unique_classes(pretrain_val_entries)} val_samples={len(pretrain_val_entries)}"
+                "Pretrain redefined split summary: "
+                f"total_images={pretrain_split_summary['total_images']} resolved={pretrain_split_summary['resolved_images']} unresolved={pretrain_split_summary['unresolved_images']} | "
+                f"train_classes={pretrain_split_summary['train_classes']} train_samples={pretrain_split_summary['train_samples']} | "
+                f"seen_test_classes={pretrain_split_summary['seen_test_classes']} seen_test_samples={pretrain_split_summary['seen_test_samples']} | "
+                f"unseen_classes={pretrain_split_summary['unseen_classes']} unseen_test_samples={pretrain_split_summary['unseen_test_samples']}"
             )
 
             pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
@@ -796,8 +1044,9 @@ def main() -> None:
         "pretrain_state_path": str(pretrain_state_path),
         "pretrain_split_summary": {
             "classes": len(pretrain_class_to_index) if args.pretrain_root else 0,
-            "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and pretrain_entries else {"classes": 0, "samples": 0},
-            "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and pretrain_entries else {"classes": 0, "samples": 0},
+            "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
+            "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
+            "redefined": pretrain_split_summary if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else None,
         } if args.pretrain_root else None,
         "fine_tuning_split_summary": {
             "classes": len(class_to_index),

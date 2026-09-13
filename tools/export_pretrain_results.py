@@ -5,7 +5,6 @@ import hashlib
 import importlib.util
 import pickle
 import random
-import re
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-codebook",
         default="outputs/260828_codebook/final_codebook.pkl",
-        help="Reference codebook used to define seen classes (IDS + Hanazono baseline).",
+        help="Fallback codebook used to define seen classes when seen/unseen split manifests are unavailable.",
     )
     parser.add_argument(
         "--prediction-codebook",
@@ -49,13 +48,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint-path",
-        default="outputs/pretrain_best_fare_model.pth",
+        default="outputs/260913_redefine_train_data/pretrain_best_fare_model.pth",
         help="Pretraining checkpoint to load.",
     )
     parser.add_argument(
         "--output-dir",
-        default="outputs/260901_codebook_CASIA/results",
+        default="outputs/260913_redefine_train_data/results",
         help="Directory for the output text report.",
+    )
+    parser.add_argument(
+        "--seen-test-manifest",
+        default="outputs/260913_redefine_train_data/pretrain_seen_test_manifest.txt",
+        help="Optional manifest containing seen-test samples created by the redefined pretraining split.",
+    )
+    parser.add_argument(
+        "--unseen-test-manifest",
+        default="outputs/260913_redefine_train_data/pretrain_unseen_test_manifest.txt",
+        help="Optional manifest containing unseen-test samples created by the redefined pretraining split.",
     )
     parser.add_argument(
         "--sample-count",
@@ -110,29 +119,6 @@ def count_manifest_lines(manifest_path: Path) -> int:
         return sum(1 for _ in handle)
 
 
-def extract_candidate_names(image_path: Path, data_root: Path) -> list[str]:
-    candidate_names: list[str] = [image_path.stem, image_path.parent.name]
-    for parent in image_path.parents:
-        if parent == data_root:
-            break
-        candidate_names.append(parent.name)
-
-    expanded_candidates: list[str] = []
-    for cand in candidate_names:
-        if not cand:
-            continue
-        no_num = re.sub(r"[ _\-]*\d+$", "", cand)
-        parts = re.split(r"[\.・_\- ]+", no_num)
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            expanded_candidates.append(part)
-            expanded_candidates.extend(list(part))
-
-    return candidate_names + expanded_candidates
-
-
 def stable_value(seed: int, class_key: str, image_path: str) -> float:
     digest = hashlib.sha1(f"{seed}|{class_key}|{image_path}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") / 2**64
@@ -175,12 +161,20 @@ class ImageBatchDataset(Dataset):
         }
 
 
-def resolve_label(image_path: Path, data_root: Path, codebook: dict[str, np.ndarray]) -> str | None:
-    for candidate in extract_candidate_names(image_path, data_root):
-        resolved = trainmod.resolve_codebook_label(candidate, codebook)
-        if resolved is not None:
-            return resolved
-    return None
+def resolve_label(image_path: Path, codebook: dict[str, np.ndarray], allowed_keys: set[str]) -> str | None:
+    return trainmod.resolve_pretrain_true_label(image_path, codebook, allowed_keys)
+
+
+def load_manifest_paths(path: Path) -> list[Path]:
+    if not path.exists():
+        return []
+    items: list[Path] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if text:
+                items.append(Path(text))
+    return items
 
 
 def main() -> None:
@@ -193,6 +187,7 @@ def main() -> None:
         raise ValueError(f"No entries were loaded from {args.prediction_codebook}.")
 
     reference_classes = set(reference_codebook.keys())
+    allowed_keys = {str(key) for key in prediction_codebook if trainmod.is_valid_unicode_codebook_key(str(key))}
     prediction_keys = sorted(prediction_codebook.keys(), key=str)
     codebook_matrix = torch.stack([torch.tensor(prediction_codebook[key], dtype=torch.float32) for key in prediction_keys])
 
@@ -209,6 +204,8 @@ def main() -> None:
     manifest_path = Path(args.manifest_path)
     data_root = Path(args.pretrain_root)
     total_lines = count_manifest_lines(manifest_path)
+    seen_test_manifest = Path(args.seen_test_manifest)
+    unseen_test_manifest = Path(args.unseen_test_manifest)
 
     seen_class_set: set[str] = set()
     unseen_class_set: set[str] = set()
@@ -289,34 +286,61 @@ def main() -> None:
                         unseen_test_total += 1
                         unseen_test_correct += int(pred_key == true_key)
 
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        for line in tqdm(handle, total=total_lines, desc="Scanning pretrain manifest", unit="img"):
-            item = line.strip()
-            if not item:
-                continue
+    if seen_test_manifest.exists() and unseen_test_manifest.exists():
+        seen_paths = load_manifest_paths(seen_test_manifest)
+        unseen_paths = load_manifest_paths(unseen_test_manifest)
+        print(f"Using split manifests: seen={seen_test_manifest} unseen={unseen_test_manifest}")
 
-            image_path = Path(item)
-            if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
-                continue
-
-            resolved = resolve_label(image_path, data_root, prediction_codebook)
+        for image_path in tqdm(seen_paths, desc="Collecting seen-test samples", unit="img"):
+            resolved = resolve_label(image_path, prediction_codebook, allowed_keys)
             if resolved is None:
                 continue
-
-            if resolved in reference_classes:
-                seen_class_set.add(resolved)
-                seen_total += 1
-                # Hold out a deterministic portion of seen-class samples for testing.
-                if stable_value(args.seed, resolved, str(image_path)) >= args.train_ratio:
-                    pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "seen"})
-            else:
-                unseen_class_set.add(resolved)
-                unseen_total += 1
-                pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "unseen"})
-
+            seen_class_set.add(resolved)
+            seen_total += 1
+            pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "seen"})
             if len(pending_entries) >= args.chunk_size:
                 flush_pending(pending_entries)
                 pending_entries = []
+
+        for image_path in tqdm(unseen_paths, desc="Collecting unseen-test samples", unit="img"):
+            resolved = resolve_label(image_path, prediction_codebook, allowed_keys)
+            if resolved is None:
+                continue
+            unseen_class_set.add(resolved)
+            unseen_total += 1
+            pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "unseen"})
+            if len(pending_entries) >= args.chunk_size:
+                flush_pending(pending_entries)
+                pending_entries = []
+    else:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in tqdm(handle, total=total_lines, desc="Scanning pretrain manifest", unit="img"):
+                item = line.strip()
+                if not item:
+                    continue
+
+                image_path = Path(item)
+                if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+                    continue
+
+                resolved = resolve_label(image_path, prediction_codebook, allowed_keys)
+                if resolved is None:
+                    continue
+
+                if resolved in reference_classes:
+                    seen_class_set.add(resolved)
+                    seen_total += 1
+                    # Hold out a deterministic portion of seen-class samples for testing.
+                    if stable_value(args.seed, resolved, str(image_path)) >= args.train_ratio:
+                        pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "seen"})
+                else:
+                    unseen_class_set.add(resolved)
+                    unseen_total += 1
+                    pending_entries.append({"image_path": str(image_path), "unicode": resolved, "group": "unseen"})
+
+                if len(pending_entries) >= args.chunk_size:
+                    flush_pending(pending_entries)
+                    pending_entries = []
 
     flush_pending(pending_entries)
 
