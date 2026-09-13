@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 import random
 from collections import defaultdict
@@ -32,18 +33,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="outputs",
-        help="Directory for checkpoints and reports.",
+        default="outputs/260913_redefine_train_data",
+        help="Directory for checkpoints, resume state, and run metadata.",
     )
     parser.add_argument(
         "--checkpoint-path",
-        default="outputs/best_fare_model.pth",
+        default="outputs/260913_redefine_train_data/best_fare_model.pth",
         help="Path to save the best fine-tuning checkpoint. Default: outputs/best_fare_model.pth",
     )
     parser.add_argument(
         "--pretrain-checkpoint-path",
-        default="outputs/pretrain_best_fare_model.pth",
+        default="outputs/260913_redefine_train_data/pretrain_best_fare_model.pth",
         help="Path to save the best pretraining checkpoint. Default: outputs/pretrain_best_fare_model.pth",
+    )
+    parser.add_argument(
+        "--state-path",
+        default="outputs/260913_redefine_train_data/training_state.pth",
+        help="Path to save the fine-tuning resume state after each epoch.",
+    )
+    parser.add_argument(
+        "--pretrain-state-path",
+        default="outputs/260913_redefine_train_data/pretrain_training_state.pth",
+        help="Path to save the pretraining resume state after each epoch.",
+    )
+    parser.add_argument(
+        "--metadata-path",
+        default="outputs/260913_redefine_train_data/run_metadata.json",
+        help="Path to save the run parameters and split summaries.",
     )
     parser.add_argument(
         "--manifest-path",
@@ -100,6 +116,30 @@ def set_reproducible_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def count_unique_classes(entries: list[dict[str, Any]]) -> int:
+    return len({str(entry["unicode"]) for entry in entries})
+
+
+def summarize_entries(entries: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "classes": count_unique_classes(entries),
+        "samples": len(entries),
+    }
+
+
+def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def normalize_unicode_key(value: Any) -> str:
@@ -493,6 +533,7 @@ def train_model_on_dataset(
     batch_size: int,
     epochs: int,
     checkpoint_path: Path,
+    state_path: Path,
     class_to_index: dict[str, int],
     seed: int,
     verbose: bool = True,
@@ -510,8 +551,36 @@ def train_model_on_dataset(
     best_accuracy = -1.0
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = -1
+    start_epoch = 1
 
-    for epoch in range(1, epochs + 1):
+    if state_path.exists():
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        if isinstance(state, dict):
+            model_state_dict = state.get("model_state_dict")
+            optimizer_state_dict = state.get("optimizer_state_dict")
+            if isinstance(model_state_dict, dict):
+                model.load_state_dict(model_state_dict)
+            if isinstance(optimizer_state_dict, dict):
+                optimizer.load_state_dict(optimizer_state_dict)
+                move_optimizer_state_to_device(optimizer, device)
+            best_accuracy = float(state.get("best_accuracy", best_accuracy))
+            best_epoch = int(state.get("best_epoch", best_epoch))
+            start_epoch = int(state.get("epoch", 0)) + 1
+            if verbose:
+                print(f"Resumed training from {state_path} at epoch {start_epoch}")
+
+    if start_epoch > epochs:
+        if verbose:
+            print(f"Checkpoint at {state_path} already covers {epochs} epochs; skipping training loop.")
+        if checkpoint_path.exists():
+            best_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if isinstance(best_state, dict) and isinstance(best_state.get("state_dict"), dict):
+                best_state_dict = best_state["state_dict"]
+        if best_state_dict is None:
+            best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        return best_accuracy, best_epoch
+
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_loss = 0.0
         seen = 0
@@ -553,6 +622,22 @@ def train_model_on_dataset(
             if verbose:
                 print(f"Saved best model checkpoint to {checkpoint_path}")
 
+        torch.save(
+            {
+                "epoch": epoch,
+                "best_epoch": best_epoch,
+                "best_accuracy": best_accuracy,
+                "class_to_index": class_to_index,
+                "codebook_dim": codebook_matrix.shape[1],
+                "model_state_dict": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+                "optimizer_state_dict": optimizer.state_dict(),
+                "seed": seed,
+            },
+            state_path,
+        )
+        if verbose:
+            print(f"Saved resume state to {state_path}")
+
     if best_state_dict is None:
         raise RuntimeError("No model checkpoint was saved during training.")
 
@@ -568,6 +653,12 @@ def main() -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     pretrain_checkpoint_path = Path(args.pretrain_checkpoint_path)
     pretrain_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path = Path(args.state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    pretrain_state_path = Path(args.pretrain_state_path)
+    pretrain_state_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = Path(args.metadata_path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest_path) if getattr(args, "manifest_path", None) else None
     pretrain_manifest_path = Path(args.pretrain_manifest_path) if getattr(args, "pretrain_manifest_path", None) else None
 
@@ -586,8 +677,10 @@ def main() -> None:
     if args.pretrain_root:
         print(f"Pretraining dataset: {args.pretrain_root}")
     print(f"Fine-tuning checkpoint path: {checkpoint_path}")
+    print(f"Fine-tuning resume state path: {state_path}")
     if args.pretrain_root:
         print(f"Pretraining checkpoint path: {pretrain_checkpoint_path}")
+        print(f"Pretraining resume state path: {pretrain_state_path}")
 
     codebook = load_codebook(Path(args.codebook))
     if not codebook:
@@ -605,11 +698,18 @@ def main() -> None:
             allow_empty=True,
         )
         if pretrain_entries:
+            pretrain_sample_summary = summarize_entries(pretrain_entries)
             print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
             pretrain_labels = [entry["label"] for entry in pretrain_entries]
             pretrain_train_idx, pretrain_val_idx = build_split(pretrain_labels, args.train_ratio, args.seed)
             pretrain_train_entries = [pretrain_entries[idx] for idx in pretrain_train_idx]
             pretrain_val_entries = [pretrain_entries[idx] for idx in pretrain_val_idx]
+            print(
+                "Pretrain split summary: "
+                f"classes={pretrain_sample_summary['classes']} samples={pretrain_sample_summary['samples']} | "
+                f"train_classes={count_unique_classes(pretrain_train_entries)} train_samples={len(pretrain_train_entries)} | "
+                f"val_classes={count_unique_classes(pretrain_val_entries)} val_samples={len(pretrain_val_entries)}"
+            )
 
             pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
             pretrain_codebook_matrix = torch.stack(pretrain_codebook_vectors).to(device)
@@ -623,6 +723,7 @@ def main() -> None:
                 batch_size=args.batch_size,
                 epochs=args.pretrain_epochs,
                 checkpoint_path=pretrain_checkpoint_path,
+                state_path=pretrain_state_path,
                 class_to_index=pretrain_class_to_index,
                 seed=args.seed,
                 verbose=True,
@@ -649,6 +750,12 @@ def main() -> None:
 
     train_entries = [entries[idx] for idx in train_indices]
     val_entries = [entries[idx] for idx in val_indices]
+    print(
+        "Fine-tuning split summary: "
+        f"classes={len(class_to_index)} samples={len(entries)} | "
+        f"train_classes={count_unique_classes(train_entries)} train_samples={len(train_entries)} | "
+        f"val_classes={count_unique_classes(val_entries)} val_samples={len(val_entries)}"
+    )
 
     codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
     codebook_matrix = codebook_matrix.to(device)
@@ -666,11 +773,42 @@ def main() -> None:
         batch_size=args.batch_size,
         epochs=args.epochs,
         checkpoint_path=checkpoint_path,
+        state_path=state_path,
         class_to_index=class_to_index,
         seed=args.seed,
         verbose=True,
     )
 
+    metadata = {
+        "output_dir": str(output_dir),
+        "data_root": str(args.data_root),
+        "pretrain_root": str(args.pretrain_root) if args.pretrain_root else None,
+        "codebook": str(args.codebook),
+        "train_ratio": args.train_ratio,
+        "epochs": args.epochs,
+        "pretrain_epochs": args.pretrain_epochs,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "device": args.device,
+        "checkpoint_path": str(checkpoint_path),
+        "state_path": str(state_path),
+        "pretrain_checkpoint_path": str(pretrain_checkpoint_path),
+        "pretrain_state_path": str(pretrain_state_path),
+        "pretrain_split_summary": {
+            "classes": len(pretrain_class_to_index) if args.pretrain_root else 0,
+            "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and pretrain_entries else {"classes": 0, "samples": 0},
+            "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and pretrain_entries else {"classes": 0, "samples": 0},
+        } if args.pretrain_root else None,
+        "fine_tuning_split_summary": {
+            "classes": len(class_to_index),
+            "train": summarize_entries(train_entries),
+            "val": summarize_entries(val_entries),
+        },
+        "best_accuracy": best_accuracy,
+        "best_epoch": best_epoch,
+    }
+    save_json(metadata_path, metadata)
+    print(f"Saved run metadata to {metadata_path}")
     print(f"Training complete. Best validation accuracy: {best_accuracy:.4f} at epoch {best_epoch}.")
     print(f"Best model saved to {checkpoint_path}")
 
