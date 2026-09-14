@@ -13,9 +13,10 @@ import re
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data._utils.collate import default_collate
 from torchvision import models
 from tqdm import tqdm
 
@@ -667,11 +668,14 @@ class CharacterImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> dict[str, Any] | None:
         entry = self.entries[index]
         image_path = Path(entry["image_path"])
-
-        image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        try:
+            image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        except (UnidentifiedImageError, OSError):
+            # Drop unreadable images instead of crashing a long-running training job.
+            return None
         array = np.asarray(image, dtype=np.float32) / 255.0
         array = np.transpose(array, (2, 0, 1))
         tensor = torch.from_numpy(array)
@@ -686,6 +690,13 @@ class CharacterImageDataset(Dataset):
             "book_id": entry["book_id"],
             "image_path": str(image_path),
         }
+
+
+def safe_collate(batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    filtered = [item for item in batch if item is not None]
+    if not filtered:
+        return None
+    return default_collate(filtered)
 
 
 class STEBinarize(torch.autograd.Function):
@@ -755,6 +766,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, d
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+            if batch is None:
+                continue
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
             binary_code = model(images)
@@ -788,8 +801,22 @@ def train_model_on_dataset(
     val_dataset = CharacterImageDataset(val_entries, image_size=96)
     num_workers = 0
     pin_memory = True if device.type == "cuda" else False
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=safe_collate,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=safe_collate,
+    )
 
     optimizer = torch.optim.Adadelta(model.parameters(), lr=0.1, rho=0.95, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
@@ -832,6 +859,8 @@ def train_model_on_dataset(
         seen = 0
 
         for batch in tqdm(train_loader, desc=f"Train E{epoch}", leave=False):
+            if batch is None:
+                continue
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
