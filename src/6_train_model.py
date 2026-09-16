@@ -5,7 +5,9 @@ import hashlib
 import json
 import pickle
 import random
+import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 import os
@@ -13,9 +15,10 @@ import re
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data._utils.collate import default_collate
 from torchvision import models
 from tqdm import tqdm
 
@@ -135,7 +138,48 @@ def parse_args() -> argparse.Namespace:
         default="outputs/260913_redefine_train_data/pretrain_unseen_test_manifest.txt",
         help="Output manifest path for pretraining unseen test samples.",
     )
+    parser.add_argument(
+        "--log-path",
+        default=None,
+        help="Optional path to save stdout/stderr logs. If omitted, logs are written only to terminal.",
+    )
     return parser.parse_args()
+
+
+class TeeStream:
+    def __init__(self, console: Any, file_handle: Any) -> None:
+        self.console = console
+        self.file_handle = file_handle
+
+    def write(self, text: str) -> int:
+        written_console = self.console.write(text)
+        self.file_handle.write(text)
+        return written_console
+
+    def flush(self) -> None:
+        self.console.flush()
+        self.file_handle.flush()
+
+
+def setup_log_stream(log_path: Path) -> tuple[Any, Any, Any]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = log_path.open("a", encoding="utf-8")
+    fh.write("\n")
+    fh.write(f"===== Run started at {datetime.now().isoformat(timespec='seconds')} =====\n")
+    fh.flush()
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, fh)
+    sys.stderr = TeeStream(original_stderr, fh)
+    return fh, original_stdout, original_stderr
+
+
+def restore_log_stream(file_handle: Any, original_stdout: Any, original_stderr: Any) -> None:
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    file_handle.flush()
+    file_handle.close()
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -420,7 +464,6 @@ def collect_class_samples(data_root: Path, codebook: dict[str, np.ndarray], max_
         iterator = iter_paths_from_manifest(manifest_path)
         iterator = tqdm(iterator, desc=f"Reading manifest {manifest_path.name}", unit="path", leave=False)
     else:
-        # Iterate recursively with a progress indicator; large datasets (CASIA) can take long to scan.
         iterator = data_root.rglob("*")
         iterator = tqdm(iterator, desc=f"Scanning {data_root}", unit="path", leave=False)
 
@@ -667,11 +710,14 @@ class CharacterImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> dict[str, Any] | None:
         entry = self.entries[index]
         image_path = Path(entry["image_path"])
-
-        image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        try:
+            image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        except (UnidentifiedImageError, OSError):
+            # Drop unreadable images instead of crashing a long-running training job.
+            return None
         array = np.asarray(image, dtype=np.float32) / 255.0
         array = np.transpose(array, (2, 0, 1))
         tensor = torch.from_numpy(array)
@@ -686,6 +732,13 @@ class CharacterImageDataset(Dataset):
             "book_id": entry["book_id"],
             "image_path": str(image_path),
         }
+
+
+def safe_collate(batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    filtered = [item for item in batch if item is not None]
+    if not filtered:
+        return None
+    return default_collate(filtered)
 
 
 class STEBinarize(torch.autograd.Function):
@@ -755,6 +808,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, d
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+            if batch is None:
+                continue
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
             binary_code = model(images)
@@ -788,8 +843,22 @@ def train_model_on_dataset(
     val_dataset = CharacterImageDataset(val_entries, image_size=96)
     num_workers = 0
     pin_memory = True if device.type == "cuda" else False
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=safe_collate,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=safe_collate,
+    )
 
     optimizer = torch.optim.Adadelta(model.parameters(), lr=0.1, rho=0.95, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
@@ -832,6 +901,8 @@ def train_model_on_dataset(
         seen = 0
 
         for batch in tqdm(train_loader, desc=f"Train E{epoch}", leave=False):
+            if batch is None:
+                continue
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
@@ -895,171 +966,190 @@ def main() -> None:
     set_reproducible_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = Path(args.checkpoint_path)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    pretrain_checkpoint_path = Path(args.pretrain_checkpoint_path)
-    pretrain_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path = Path(args.state_path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    pretrain_state_path = Path(args.pretrain_state_path)
-    pretrain_state_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path = Path(args.metadata_path)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path = Path(args.manifest_path) if getattr(args, "manifest_path", None) else None
-    pretrain_manifest_path = Path(args.pretrain_manifest_path) if getattr(args, "pretrain_manifest_path", None) else None
+    log_path = Path(args.log_path) if getattr(args, "log_path", None) else None
+    log_file_handle = None
+    original_stdout = None
+    original_stderr = None
+    if log_path is not None:
+        log_file_handle, original_stdout, original_stderr = setup_log_stream(log_path)
 
-    # Optionally build manifest files before scanning (can be faster than repeated rglob)
-    if args.build_manifest:
-        if pretrain_manifest_path and args.pretrain_root:
-            print(f"Building pretrain manifest {pretrain_manifest_path} from {args.pretrain_root}...")
-            n = build_manifest(Path(args.pretrain_root), pretrain_manifest_path)
-            print(f"Wrote {n} entries to {pretrain_manifest_path}")
-        if manifest_path:
-            print(f"Building main manifest {manifest_path} from {args.data_root}...")
-            n = build_manifest(Path(args.data_root), manifest_path)
-            print(f"Wrote {n} entries to {manifest_path}")
+    try:
+        checkpoint_path = Path(args.checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        pretrain_checkpoint_path = Path(args.pretrain_checkpoint_path)
+        pretrain_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path = Path(args.state_path)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        pretrain_state_path = Path(args.pretrain_state_path)
+        pretrain_state_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path = Path(args.metadata_path)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path = Path(args.manifest_path) if getattr(args, "manifest_path", None) else None
+        pretrain_manifest_path = Path(args.pretrain_manifest_path) if getattr(args, "pretrain_manifest_path", None) else None
 
-    print(f"Training started: epochs={args.epochs}, batch_size={args.batch_size}, device={args.device}")
-    if args.pretrain_root:
-        print(f"Pretraining dataset: {args.pretrain_root}")
-    print(f"Fine-tuning checkpoint path: {checkpoint_path}")
-    print(f"Fine-tuning resume state path: {state_path}")
-    if args.pretrain_root:
-        print(f"Pretraining checkpoint path: {pretrain_checkpoint_path}")
-        print(f"Pretraining resume state path: {pretrain_state_path}")
+        # Optionally build manifest files before scanning (can be faster than repeated rglob)
+        if args.build_manifest:
+            if pretrain_manifest_path and args.pretrain_root:
+                print(f"Building pretrain manifest {pretrain_manifest_path} from {args.pretrain_root}...")
+                n = build_manifest(Path(args.pretrain_root), pretrain_manifest_path)
+                print(f"Wrote {n} entries to {pretrain_manifest_path}")
+            if manifest_path:
+                print(f"Building main manifest {manifest_path} from {args.data_root}...")
+                n = build_manifest(Path(args.data_root), manifest_path)
+                print(f"Wrote {n} entries to {manifest_path}")
 
-    codebook = load_codebook(Path(args.codebook))
-    if not codebook:
-        raise ValueError(f"No entries were loaded from {args.codebook}.")
+        print(f"Training started: epochs={args.epochs}, batch_size={args.batch_size}, device={args.device}")
+        if log_path is not None:
+            print(f"Log file path: {log_path}")
+        if args.pretrain_root:
+            print(f"Pretraining dataset: {args.pretrain_root}")
+        print(f"Fine-tuning checkpoint path: {checkpoint_path}")
+        print(f"Fine-tuning resume state path: {state_path}")
+        if args.pretrain_root:
+            print(f"Pretraining checkpoint path: {pretrain_checkpoint_path}")
+            print(f"Pretraining resume state path: {pretrain_state_path}")
 
-    device = torch.device(args.device)
-    if args.pretrain_root:
-        pretrain_root = Path(args.pretrain_root)
-        pretrain_class_to_index, pretrain_train_entries, pretrain_val_entries, pretrain_split_summary = collect_pretrain_entries_with_redefined_split(
-            pretrain_root,
-            codebook,
-            seed=args.seed,
-            train_class_ratio=args.pretrain_train_class_ratio,
-            seen_train_ratio=args.pretrain_seen_train_ratio,
-            max_classes=args.pretrain_max_classes,
-            max_samples_per_class=args.pretrain_max_samples_per_class,
-            manifest_path=pretrain_manifest_path,
-        )
-        if pretrain_train_entries or pretrain_val_entries:
-            write_manifest(pretrain_train_entries, Path(args.pretrain_split_manifest_train))
-            write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "seen_test"], Path(args.pretrain_split_manifest_seen_test))
-            write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "unseen_test"], Path(args.pretrain_split_manifest_unseen_test))
+        codebook = load_codebook(Path(args.codebook))
+        if not codebook:
+            raise ValueError(f"No entries were loaded from {args.codebook}.")
 
-            print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
-            print(
-                "Pretrain redefined split summary: "
-                f"total_images={pretrain_split_summary['total_images']} resolved={pretrain_split_summary['resolved_images']} unresolved={pretrain_split_summary['unresolved_images']} | "
-                f"train_classes={pretrain_split_summary['train_classes']} train_samples={pretrain_split_summary['train_samples']} | "
-                f"seen_test_classes={pretrain_split_summary['seen_test_classes']} seen_test_samples={pretrain_split_summary['seen_test_samples']} | "
-                f"unseen_classes={pretrain_split_summary['unseen_classes']} unseen_test_samples={pretrain_split_summary['unseen_test_samples']}"
-            )
+        device = torch.device(args.device)
+        pretrain_class_to_index: dict[str, int] = {}
+        pretrain_train_entries: list[dict[str, Any]] = []
+        pretrain_val_entries: list[dict[str, Any]] = []
+        pretrain_split_summary: dict[str, Any] | None = None
 
-            pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
-            pretrain_codebook_matrix = torch.stack(pretrain_codebook_vectors).to(device)
-            pretrain_model = FareRecognitionModel(codebook_dim=pretrain_codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
-            best_pre_acc, best_pre_epoch = train_model_on_dataset(
-                model=pretrain_model,
-                train_entries=pretrain_train_entries,
-                val_entries=pretrain_val_entries,
-                codebook_matrix=pretrain_codebook_matrix,
-                device=device,
-                batch_size=args.batch_size,
-                epochs=args.pretrain_epochs,
-                checkpoint_path=pretrain_checkpoint_path,
-                state_path=pretrain_state_path,
-                class_to_index=pretrain_class_to_index,
+        if args.pretrain_root:
+            pretrain_root = Path(args.pretrain_root)
+            pretrain_class_to_index, pretrain_train_entries, pretrain_val_entries, pretrain_split_summary = collect_pretrain_entries_with_redefined_split(
+                pretrain_root,
+                codebook,
                 seed=args.seed,
-                verbose=True,
+                train_class_ratio=args.pretrain_train_class_ratio,
+                seen_train_ratio=args.pretrain_seen_train_ratio,
+                max_classes=args.pretrain_max_classes,
+                max_samples_per_class=args.pretrain_max_samples_per_class,
+                manifest_path=pretrain_manifest_path,
             )
-            print(f"Pretraining complete. Best validation accuracy on pretraining data: {best_pre_acc:.4f} at epoch {best_pre_epoch}.")
-        else:
-            print(f"No pretraining samples found under {pretrain_root}. Continuing without pretraining.")
+            if pretrain_train_entries or pretrain_val_entries:
+                write_manifest(pretrain_train_entries, Path(args.pretrain_split_manifest_train))
+                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "seen_test"], Path(args.pretrain_split_manifest_seen_test))
+                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "unseen_test"], Path(args.pretrain_split_manifest_unseen_test))
 
-    class_to_index, entries = collect_class_samples(
-        Path(args.data_root),
-        codebook,
-        max_classes=args.max_classes,
-        max_samples_per_class=args.max_samples_per_class,
-        manifest_path=manifest_path,
-    )
+                print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
+                print(
+                    "Pretrain redefined split summary: "
+                    f"total_images={pretrain_split_summary['total_images']} resolved={pretrain_split_summary['resolved_images']} unresolved={pretrain_split_summary['unresolved_images']} | "
+                    f"train_classes={pretrain_split_summary['train_classes']} train_samples={pretrain_split_summary['train_samples']} | "
+                    f"seen_test_classes={pretrain_split_summary['seen_test_classes']} seen_test_samples={pretrain_split_summary['seen_test_samples']} | "
+                    f"unseen_classes={pretrain_split_summary['unseen_classes']} unseen_test_samples={pretrain_split_summary['unseen_test_samples']}"
+                )
 
-    if len(class_to_index) == 0:
-        raise ValueError("No valid CodeBook classes were found in the dataset.")
+                pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
+                pretrain_codebook_matrix = torch.stack(pretrain_codebook_vectors).to(device)
+                pretrain_model = FareRecognitionModel(codebook_dim=pretrain_codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
+                best_pre_acc, best_pre_epoch = train_model_on_dataset(
+                    model=pretrain_model,
+                    train_entries=pretrain_train_entries,
+                    val_entries=pretrain_val_entries,
+                    codebook_matrix=pretrain_codebook_matrix,
+                    device=device,
+                    batch_size=args.batch_size,
+                    epochs=args.pretrain_epochs,
+                    checkpoint_path=pretrain_checkpoint_path,
+                    state_path=pretrain_state_path,
+                    class_to_index=pretrain_class_to_index,
+                    seed=args.seed,
+                    verbose=True,
+                )
+                print(f"Pretraining complete. Best validation accuracy on pretraining data: {best_pre_acc:.4f} at epoch {best_pre_epoch}.")
+            else:
+                print(f"No pretraining samples found under {pretrain_root}. Continuing without pretraining.")
 
-    labels = [entry["label"] for entry in entries]
-    train_indices, val_indices = build_split(labels, args.train_ratio, args.seed)
-    if not train_indices or not val_indices:
-        raise ValueError("Training or validation split is empty; use a larger dataset or lower train_ratio.")
+        class_to_index, entries = collect_class_samples(
+            Path(args.data_root),
+            codebook,
+            max_classes=args.max_classes,
+            max_samples_per_class=args.max_samples_per_class,
+            manifest_path=manifest_path,
+        )
 
-    train_entries = [entries[idx] for idx in train_indices]
-    val_entries = [entries[idx] for idx in val_indices]
-    print(
-        "Fine-tuning split summary: "
-        f"classes={len(class_to_index)} samples={len(entries)} | "
-        f"train_classes={count_unique_classes(train_entries)} train_samples={len(train_entries)} | "
-        f"val_classes={count_unique_classes(val_entries)} val_samples={len(val_entries)}"
-    )
+        if len(class_to_index) == 0:
+            raise ValueError("No valid CodeBook classes were found in the dataset.")
 
-    codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
-    codebook_matrix = codebook_matrix.to(device)
+        labels = [entry["label"] for entry in entries]
+        train_indices, val_indices = build_split(labels, args.train_ratio, args.seed)
+        if not train_indices or not val_indices:
+            raise ValueError("Training or validation split is empty; use a larger dataset or lower train_ratio.")
 
-    model = FareRecognitionModel(codebook_dim=codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
-    if args.pretrain_root and 'pretrain_model' in locals():
-        model.load_state_dict(pretrain_model.state_dict())
+        train_entries = [entries[idx] for idx in train_indices]
+        val_entries = [entries[idx] for idx in val_indices]
+        print(
+            "Fine-tuning split summary: "
+            f"classes={len(class_to_index)} samples={len(entries)} | "
+            f"train_classes={count_unique_classes(train_entries)} train_samples={len(train_entries)} | "
+            f"val_classes={count_unique_classes(val_entries)} val_samples={len(val_entries)}"
+        )
 
-    best_accuracy, best_epoch = train_model_on_dataset(
-        model=model,
-        train_entries=train_entries,
-        val_entries=val_entries,
-        codebook_matrix=codebook_matrix,
-        device=device,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        checkpoint_path=checkpoint_path,
-        state_path=state_path,
-        class_to_index=class_to_index,
-        seed=args.seed,
-        verbose=True,
-    )
+        codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
+        codebook_matrix = codebook_matrix.to(device)
 
-    metadata = {
-        "output_dir": str(output_dir),
-        "data_root": str(args.data_root),
-        "pretrain_root": str(args.pretrain_root) if args.pretrain_root else None,
-        "codebook": str(args.codebook),
-        "train_ratio": args.train_ratio,
-        "epochs": args.epochs,
-        "pretrain_epochs": args.pretrain_epochs,
-        "batch_size": args.batch_size,
-        "seed": args.seed,
-        "device": args.device,
-        "checkpoint_path": str(checkpoint_path),
-        "state_path": str(state_path),
-        "pretrain_checkpoint_path": str(pretrain_checkpoint_path),
-        "pretrain_state_path": str(pretrain_state_path),
-        "pretrain_split_summary": {
-            "classes": len(pretrain_class_to_index) if args.pretrain_root else 0,
-            "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
-            "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
-            "redefined": pretrain_split_summary if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else None,
-        } if args.pretrain_root else None,
-        "fine_tuning_split_summary": {
-            "classes": len(class_to_index),
-            "train": summarize_entries(train_entries),
-            "val": summarize_entries(val_entries),
-        },
-        "best_accuracy": best_accuracy,
-        "best_epoch": best_epoch,
-    }
-    save_json(metadata_path, metadata)
-    print(f"Saved run metadata to {metadata_path}")
-    print(f"Training complete. Best validation accuracy: {best_accuracy:.4f} at epoch {best_epoch}.")
-    print(f"Best model saved to {checkpoint_path}")
+        model = FareRecognitionModel(codebook_dim=codebook_matrix.shape[1], hidden_size=256, num_layers=2).to(device)
+        if args.pretrain_root and 'pretrain_model' in locals():
+            model.load_state_dict(pretrain_model.state_dict())
+
+        best_accuracy, best_epoch = train_model_on_dataset(
+            model=model,
+            train_entries=train_entries,
+            val_entries=val_entries,
+            codebook_matrix=codebook_matrix,
+            device=device,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            checkpoint_path=checkpoint_path,
+            state_path=state_path,
+            class_to_index=class_to_index,
+            seed=args.seed,
+            verbose=True,
+        )
+
+        metadata = {
+            "output_dir": str(output_dir),
+            "data_root": str(args.data_root),
+            "pretrain_root": str(args.pretrain_root) if args.pretrain_root else None,
+            "codebook": str(args.codebook),
+            "train_ratio": args.train_ratio,
+            "epochs": args.epochs,
+            "pretrain_epochs": args.pretrain_epochs,
+            "batch_size": args.batch_size,
+            "seed": args.seed,
+            "device": args.device,
+            "checkpoint_path": str(checkpoint_path),
+            "state_path": str(state_path),
+            "pretrain_checkpoint_path": str(pretrain_checkpoint_path),
+            "pretrain_state_path": str(pretrain_state_path),
+            "pretrain_split_summary": {
+                "classes": len(pretrain_class_to_index) if args.pretrain_root else 0,
+                "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
+                "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
+                "redefined": pretrain_split_summary if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else None,
+            } if args.pretrain_root else None,
+            "fine_tuning_split_summary": {
+                "classes": len(class_to_index),
+                "train": summarize_entries(train_entries),
+                "val": summarize_entries(val_entries),
+            },
+            "best_accuracy": best_accuracy,
+            "best_epoch": best_epoch,
+        }
+        save_json(metadata_path, metadata)
+        print(f"Saved run metadata to {metadata_path}")
+        print(f"Training complete. Best validation accuracy: {best_accuracy:.4f} at epoch {best_epoch}.")
+        print(f"Best model saved to {checkpoint_path}")
+
+    finally:
+        if log_file_handle is not None and original_stdout is not None and original_stderr is not None:
+            restore_log_stream(log_file_handle, original_stdout, original_stderr)
 
 
 if __name__ == "__main__":
