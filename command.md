@@ -136,3 +136,29 @@ python tools/export_pretrain_results.py ^
 
 出力されるテキストは、`image_path` / `fare_code` / `predicted_unicode` / `predicted_char` / `true_unicode` / `true_char` / `group` の列を持つ。
 `group` は `seen` か `unseen` で、seen は学習済みクラスからのホールドアウト、unseen は学習に含まれないクラスを表す。
+
+データセットの文字種認識が壊れていたので再度学習．
+CASIAデータセットのうち，学習データとテストデータに分ける
+テストデータには，学習データに含まれないクラスの文字と，学習データに含まれているが，学習データには含まれていないサンプルデータが含まれるようにした．
+```
+python src/6_train_model.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --output-dir "outputs/260913_redefine_train_data" ^
+  --checkpoint-path "outputs/260913_redefine_train_data/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260913_redefine_train_data/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/260913_redefine_train_data/training_state.pth" ^
+  --pretrain-state-path "outputs/260913_redefine_train_data/pretrain_training_state.pth" ^
+  --metadata-path "outputs/260913_redefine_train_data/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/260913_redefine_train_data/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/260913_redefine_train_data/pretrain_seen_test_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/260913_redefine_train_data/pretrain_unseen_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --pretrain-epochs 1 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda
+```
