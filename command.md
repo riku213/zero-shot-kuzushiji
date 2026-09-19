@@ -162,3 +162,49 @@ python src/6_train_model.py ^
   --batch-size 32 ^
   --device cuda
 ```
+
+事前学習ヲ20エポックやる．
+python src/6_train_model.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --output-dir "outputs/260913_redefine_train_data_fresh" ^
+  --checkpoint-path "outputs/260913_redefine_train_data_fresh/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260913_redefine_train_data_fresh/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/260913_redefine_train_data_fresh/training_state.pth" ^
+  --pretrain-state-path "outputs/260913_redefine_train_data_fresh/pretrain_training_state.pth" ^
+  --metadata-path "outputs/260913_redefine_train_data_fresh/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/260913_redefine_train_data_fresh/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/260915_redefine_train_data_fresh/pretrain_seen_test_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/260915_redefine_train_data_fresh/pretrain_unseen_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda
+
+  学習再開コマンド
+
+python src/6_train_model.py ^
+--pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+--pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+--manifest-path "outputs/manifests/main_manifest.txt" ^
+--codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+--output-dir "outputs/260913_redefine_train_data_fresh" ^
+--checkpoint-path "outputs/260913_redefine_train_data_fresh/best_fare_model.pth" ^
+--pretrain-checkpoint-path "outputs/260913_redefine_train_data_fresh/pretrain_best_fare_model.pth" ^
+--state-path "outputs/260913_redefine_train_data_fresh/training_state.pth" ^
+--pretrain-state-path "outputs/260913_redefine_train_data_fresh/pretrain_training_state.pth" ^
+--metadata-path "outputs/260913_redefine_train_data_fresh/run_metadata.json" ^
+--pretrain-split-manifest-train "outputs/260913_redefine_train_data_fresh/pretrain_train_manifest.txt" ^
+--pretrain-split-manifest-seen-test "outputs/260913_redefine_train_data_fresh/pretrain_seen_test_manifest.txt" ^
+--pretrain-split-manifest-unseen-test "outputs/260913_redefine_train_data_fresh/pretrain_unseen_test_manifest.txt" ^
+--pretrain-train-class-ratio 0.8 ^
+--pretrain-seen-train-ratio 0.8 ^
+--pretrain-epochs 20 ^
+--epochs 20 ^
+--batch-size 32 ^
+--device cuda ^
+--log-path "outputs/260913_redefine_train_data_fresh/train_resume.log"
