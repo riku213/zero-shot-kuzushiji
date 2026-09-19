@@ -185,7 +185,7 @@ python src/6_train_model.py ^
   --batch-size 32 ^
   --device cuda
 
-  学習再開コマンド
+学習が途中で止まってしまったので再開コマンド
 
 python src/6_train_model.py ^
 --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
@@ -208,3 +208,63 @@ python src/6_train_model.py ^
 --batch-size 32 ^
 --device cuda ^
 --log-path "outputs/260913_redefine_train_data_fresh/train_resume.log"
+
+[26/09/19] 2x2/4x4/8x8 分割マルチスケールCNNで事前学習＋ファインチューニング
+```
+python src/7_train_model_multiscale_cnn.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --output-dir "outputs/260919_multiscale_patch_cnn" ^
+  --checkpoint-path "outputs/260919_multiscale_patch_cnn/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260919_multiscale_patch_cnn/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/260919_multiscale_patch_cnn/training_state.pth" ^
+  --pretrain-state-path "outputs/260919_multiscale_patch_cnn/pretrain_training_state.pth" ^
+  --metadata-path "outputs/260919_multiscale_patch_cnn/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/260919_multiscale_patch_cnn/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/260919_multiscale_patch_cnn/pretrain_seen_test_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/260919_multiscale_patch_cnn/pretrain_unseen_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --patch-scales 2 4 8 ^
+  --patch-image-size 24 ^
+  --encoder-dim 256 ^
+  --fusion-hidden-dim 512 ^
+  --dropout 0.2 ^
+  --log-path "outputs/260919_multiscale_patch_cnn/train.log"
+```
+
+再開コマンド
+```
+python src/7_train_model_multiscale_cnn.py ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --output-dir "outputs/260919_multiscale_patch_cnn" ^
+  --checkpoint-path "outputs/260919_multiscale_patch_cnn/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/260919_multiscale_patch_cnn/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/260919_multiscale_patch_cnn/training_state.pth" ^
+  --pretrain-state-path "outputs/260919_multiscale_patch_cnn/pretrain_training_state.pth" ^
+  --metadata-path "outputs/260919_multiscale_patch_cnn/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/260919_multiscale_patch_cnn/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/260919_multiscale_patch_cnn/pretrain_seen_test_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/260919_multiscale_patch_cnn/pretrain_unseen_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --patch-scales 2 4 8 ^
+  --patch-image-size 24 ^
+  --encoder-dim 256 ^
+  --fusion-hidden-dim 512 ^
+  --dropout 0.2 ^
+  --log-path "outputs/260919_multiscale_patch_cnn/train.log"
+```
