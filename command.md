@@ -58,6 +58,29 @@ python src/6_train_model.py ^
 
 事前学習とファインチューニングを実行
 ＜テスト＞
+
+[26/10/04] 部首画像のレンダリング (HanaMinA 優先、無ければ HanaMinB)
+```
+python src/2_render_radicals.py
+```
+画像は `outputs/radical_images/` に出力され、メタデータは `outputs/radical_render_metadata.json` に出力される．
+
+- `schema_version`: スキーマ版数 (1)
+- `run`: 実行条件．`ids_files`，代表フォント `font_path` とその `font_sha256`，`image_size`，`created_at` (UTC, ISO 8601)
+- `summary`: `total` = `rendered` + `missing_glyph` + `blank` + `error`
+- `entries[]`: 部首ごとの結果
+  - `text`, `codepoints`: 文字とコードポイント列
+  - `status`: 判定は次の順
+    - `missing_glyph`: どのフォントの cmap にも全コードポイントが無い (豆腐は描画しない)
+    - `error`: 描画中に例外が発生
+    - `blank`: cmap にあるがインク画素が 0
+    - `rendered`: 画像を保存した
+  - `renderable`: `status == rendered` のとき true
+  - `image_path`: `rendered` のときだけ画像パス．それ以外は `null` (画像は保存しない)
+  - `font_path`: 実際に使ったフォント (A 優先、無ければ B)．`missing_glyph` では A を記載
+  - `bbox`: `[x0, y0, x1, y1]` インク領域．`rendered` 以外は `null`
+  - `ink_pixel_count`: インク画素数
+  - `error`: `glyph_not_supported` または例外メッセージ．正常時は `null`
 ```
 python src/6_train_model.py ^
   --data-root "../kuzushiji-recognition/char_sep_datas" ^

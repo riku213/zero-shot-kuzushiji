@@ -4,7 +4,7 @@ import argparse
 import shutil
 from pathlib import Path
 
-from fare_pipeline import load_inventory, render_radicals, save_render_manifest
+from fare_pipeline import FontSet, load_inventory, render_radicals, save_render_manifest, save_render_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,9 +15,15 @@ def parse_args() -> argparse.Namespace:
         help="Inventory pickle produced by 1_parse_ids.py.",
     )
     parser.add_argument(
-        "--font",
-        default="dataset/fonts/HanaMinA.ttf",
-        help="TTF font used to render radicals.",
+        "--fonts",
+        nargs="+",
+        default=["dataset/fonts/HanaMinA.ttf", "dataset/fonts/HanaMinB.ttf"],
+        help="TTF fonts in priority order; the first font covering a radical is used.",
+    )
+    parser.add_argument(
+        "--metadata",
+        default="outputs/radical_render_metadata.json",
+        help="Output JSON describing the render result of every radical.",
     )
     parser.add_argument(
         "--output-dir",
@@ -37,16 +43,18 @@ def main() -> None:
     args = parse_args()
     inventory = load_inventory(Path(args.inventory))
     radicals = inventory.get("radicals", [])
-    font_path = Path(args.font)
+    fonts = FontSet(Path(p) for p in args.fonts)
     output_dir = Path(args.output_dir)
 
     if output_dir.exists():
         shutil.rmtree(output_dir)
 
-    rendered, alien_radicals = render_radicals(radicals, font_path, output_dir, image_size=args.image_size)
+    rendered, alien_radicals = render_radicals(radicals, fonts, output_dir, image_size=args.image_size)
     save_render_manifest(rendered, alien_radicals, Path(args.manifest))
+    save_render_metadata(rendered, fonts, inventory.get("source_files", []), args.image_size, Path(args.metadata))
 
     print(f"Rendered {len(rendered) - len(alien_radicals)} radicals into {output_dir.resolve()}")
+    print(f"Saved metadata to {Path(args.metadata).resolve()}")
     print(f"Alien radicals: {len(alien_radicals)}")
     print(f"Saved manifest to {Path(args.manifest).resolve()}")
 
