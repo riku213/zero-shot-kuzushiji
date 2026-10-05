@@ -67,7 +67,7 @@ def build_feature_extractor(device: torch.device) -> nn.Module:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    rendered_radicals = load_rendered_radicals(Path(args.manifest))
+    rendered_radicals = [r for r in load_rendered_radicals(Path(args.manifest)) if r.renderable and r.image_path]
 
     dataset = RadicalImageDataset(rendered_radicals, image_size=args.image_size)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
