@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 from torchvision import models
 from tqdm import tqdm
+from structured_codebook import codebook_logits, load_codebook as load_codebook_payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -305,36 +306,7 @@ def unicode_aliases(value: Any) -> set[str]:
 
 
 def load_codebook(codebook_path: Path) -> dict[str, np.ndarray]:
-    with codebook_path.open("rb") as handle:
-        payload = pickle.load(handle)
-
-    if isinstance(payload, dict):
-        if "codebook" in payload and isinstance(payload["codebook"], dict):
-            payload = payload["codebook"]
-        if "entries" in payload and isinstance(payload["entries"], list):
-            entries = payload["entries"]
-            converted: dict[str, np.ndarray] = {}
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                key = item.get("unicode") or item.get("class") or item.get("label")
-                vector = item.get("code") or item.get("vector") or item.get("embedding")
-                if key is None or vector is None:
-                    continue
-                converted[str(key)] = np.asarray(vector, dtype=np.float32)
-            if converted:
-                return converted
-
-    if not isinstance(payload, dict):
-        raise TypeError(f"Unsupported codebook format in {codebook_path}: {type(payload)!r}")
-
-    converted: dict[str, np.ndarray] = {}
-    for key, value in payload.items():
-        if isinstance(value, (list, tuple, np.ndarray)):
-            converted[str(key)] = np.asarray(value, dtype=np.float32)
-    if not converted:
-        raise ValueError(f"No vector-based entries were found in {codebook_path}.")
-    return converted
+    return load_codebook_payload(codebook_path)
 
 
 def resolve_codebook_label(candidate: str, codebook: dict[str, np.ndarray]) -> str | None:
@@ -799,7 +771,13 @@ def build_split(labels: list[int], train_ratio: float, seed: int) -> tuple[list[
     return train_indices, val_indices
 
 
-def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, device: torch.device) -> tuple[float, float]:
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    codebook: torch.Tensor,
+    device: torch.device,
+    structured_codebook: bool = False,
+) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -813,7 +791,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, codebook: torch.Tensor, d
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
             binary_code = model(images)
-            logits = binary_code.mm(codebook.t())
+            logits = codebook_logits(binary_code, codebook, structured_codebook)
             loss = criterion(logits, labels)
             total_loss += loss.item() * images.size(0)
             predictions = logits.argmax(dim=1)
@@ -837,6 +815,7 @@ def train_model_on_dataset(
     state_path: Path,
     class_to_index: dict[str, int],
     seed: int,
+    structured_codebook: bool = False,
     verbose: bool = True,
 ) -> tuple[float, float]:
     train_dataset = CharacterImageDataset(train_entries, image_size=96)
@@ -908,7 +887,7 @@ def train_model_on_dataset(
 
             optimizer.zero_grad()
             encoded = model(images)
-            logits = encoded.mm(codebook_matrix.t())
+            logits = codebook_logits(encoded, codebook_matrix, structured_codebook)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -917,7 +896,7 @@ def train_model_on_dataset(
             seen += images.size(0)
 
         train_loss = running_loss / max(1, seen)
-        val_loss, val_accuracy = evaluate(model, val_loader, codebook_matrix, device)
+        val_loss, val_accuracy = evaluate(model, val_loader, codebook_matrix, device, structured_codebook)
 
         if verbose:
             print(f"Epoch {epoch:02d}/{epochs:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_accuracy:.4f}")
@@ -1060,6 +1039,7 @@ def main() -> None:
                     state_path=pretrain_state_path,
                     class_to_index=pretrain_class_to_index,
                     seed=args.seed,
+                    structured_codebook=bool(getattr(codebook, "structured", False)),
                     verbose=True,
                 )
                 print(f"Pretraining complete. Best validation accuracy on pretraining data: {best_pre_acc:.4f} at epoch {best_pre_epoch}.")
@@ -1110,6 +1090,7 @@ def main() -> None:
             state_path=state_path,
             class_to_index=class_to_index,
             seed=args.seed,
+            structured_codebook=bool(getattr(codebook, "structured", False)),
             verbose=True,
         )
 
@@ -1124,6 +1105,7 @@ def main() -> None:
             "batch_size": args.batch_size,
             "seed": args.seed,
             "device": args.device,
+            "structured_codebook": bool(getattr(codebook, "structured", False)),
             "checkpoint_path": str(checkpoint_path),
             "state_path": str(state_path),
             "pretrain_checkpoint_path": str(pretrain_checkpoint_path),

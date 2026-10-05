@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import pickle
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import numpy as np
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
 import torch
 
@@ -35,8 +38,13 @@ class RadicalInventory:
 class RenderedRadical:
     radical: str
     codepoint: str
-    image_path: str
+    image_path: Optional[str]
     renderable: bool
+    font_path: Optional[str] = None
+    status: str = "rendered"
+    bbox: Optional[list[int]] = None
+    ink_pixel_count: int = 0
+    error: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -166,6 +174,27 @@ def load_inventory(inventory_path: Path) -> dict:
         return pickle.load(handle)
 
 
+class FontSet:
+    """Fonts in priority order; a text uses the first font whose cmap covers all its codepoints."""
+
+    def __init__(self, font_paths: Iterable[Path]) -> None:
+        self.paths = [Path(p) for p in font_paths]
+        self.cmaps: list[set[int]] = []
+        self.sha256: dict[Path, str] = {}
+        for path in self.paths:
+            font = TTFont(str(path), lazy=True)
+            self.cmaps.append(set(font.getBestCmap().keys()))
+            font.close()
+            self.sha256[path] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def select(self, text: str) -> Optional[Path]:
+        codepoints = [ord(char) for char in text]
+        for path, cmap in zip(self.paths, self.cmaps):
+            if all(cp in cmap for cp in codepoints):
+                return path
+        return None
+
+
 def _best_font_size(text: str, font_path: Path, image_size: int, max_ratio: float = 0.78) -> ImageFont.FreeTypeFont:
     max_side = int(image_size * max_ratio)
     for size in range(int(image_size * 0.8), 10, -2):
@@ -214,7 +243,11 @@ def render_radical_image(radical: str, font_path: Path, output_path: Path, image
     return renderable
 
 
-def render_radicals(radicals: Iterable[str], font_path: Path, output_dir: Path, image_size: int = 96) -> tuple[list[RenderedRadical], list[str]]:
+def _posix(path: Path | str) -> str:
+    return Path(path).as_posix()
+
+
+def render_radicals(radicals: Iterable[str], fonts: FontSet, output_dir: Path, image_size: int = 96) -> tuple[list[RenderedRadical], list[str]]:
     rendered: list[RenderedRadical] = []
     alien_radicals: list[str] = []
 
@@ -222,12 +255,93 @@ def render_radicals(radicals: Iterable[str], font_path: Path, output_dir: Path, 
     for radical in radicals:
         codepoint = "_".join(f"U+{ord(char):04X}" for char in radical)
         image_path = output_dir / f"{codepoint}.png"
-        renderable = render_radical_image(radical, font_path, image_path, image_size=image_size)
-        rendered.append(RenderedRadical(radical=radical, codepoint=codepoint, image_path=str(image_path), renderable=renderable))
-        if not renderable:
+        font_path = fonts.select(radical)
+        item = RenderedRadical(
+            radical=radical,
+            codepoint=codepoint,
+            image_path=None,
+            renderable=False,
+            font_path=_posix(font_path or fonts.paths[0]),
+        )
+
+        if font_path is None:
+            item.status = "missing_glyph"
+            item.error = "glyph_not_supported"
+        else:
+            try:
+                canvas = _draw_radical(radical, font_path, image_size)
+                mask = np.asarray(canvas) < 128
+                item.ink_pixel_count = int(mask.sum())
+                if item.ink_pixel_count == 0:
+                    item.status = "blank"
+                else:
+                    ys, xs = np.nonzero(mask)
+                    item.bbox = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    canvas.save(image_path)
+                    item.image_path = _posix(image_path)
+                    item.renderable = True
+                    item.status = "rendered"
+            except Exception as exc:
+                item.status = "error"
+                item.error = f"{type(exc).__name__}: {exc}"
+
+        rendered.append(item)
+        if not item.renderable:
             alien_radicals.append(radical)
 
     return rendered, alien_radicals
+
+
+def _draw_radical(radical: str, font_path: Path, image_size: int) -> Image.Image:
+    canvas = Image.new("L", (image_size, image_size), color=255)
+    draw = ImageDraw.Draw(canvas)
+    font = _best_font_size(radical, font_path, image_size)
+    bbox = draw.textbbox((0, 0), radical, font=font)
+    x = (image_size - (bbox[2] - bbox[0])) / 2 - bbox[0]
+    y = (image_size - (bbox[3] - bbox[1])) / 2 - bbox[1]
+    draw.text((x, y), radical, font=font, fill=0)
+    return canvas
+
+
+def save_render_metadata(
+    rendered: list[RenderedRadical],
+    fonts: FontSet,
+    ids_files: list[str],
+    image_size: int,
+    output_path: Path,
+) -> None:
+    statuses = ["rendered", "missing_glyph", "blank", "error"]
+    counts = Counter(item.status for item in rendered)
+    primary = fonts.paths[0]
+    payload = {
+        "schema_version": 1,
+        "run": {
+            "ids_files": [_posix(p) for p in ids_files],
+            "font_path": _posix(primary),
+            "font_sha256": fonts.sha256[primary],
+            "image_size": image_size,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "summary": {"total": len(rendered), **{key: counts.get(key, 0) for key in statuses}},
+        "entries": [
+            {
+                "text": item.radical,
+                "codepoints": [f"U+{ord(char):04X}" for char in item.radical],
+                "status": item.status,
+                "renderable": item.renderable,
+                "image_path": item.image_path,
+                "font_path": item.font_path,
+                "bbox": item.bbox,
+                "ink_pixel_count": item.ink_pixel_count,
+                "error": item.error,
+            }
+            for item in rendered
+        ],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 def save_render_manifest(rendered: list[RenderedRadical], alien_radicals: list[str], output_path: Path) -> None:

@@ -58,7 +58,11 @@ def main() -> None:
 
     feature_records = feature_payload.get("records", [])
     renderable_records = [record for record in feature_records if record.get("renderable", True) and record.get("radical") not in alien_radicals]
-    alien_records = [record for record in feature_records if not record.get("renderable", True) or record.get("radical") in alien_radicals]
+    alien_records = [
+        {"radical": item["radical"], "codepoint": item["codepoint"], "image_path": item.get("image_path"), "feature": []}
+        for item in render_manifest.get("rendered", [])
+        if not item.get("renderable", True)
+    ]
 
     if not renderable_records:
         raise RuntimeError("No renderable radicals were found in the feature payload.")
