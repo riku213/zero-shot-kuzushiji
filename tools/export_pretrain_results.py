@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import pickle
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,9 @@ from tqdm import tqdm
 
 def load_module(module_name: str, relative_path: str):
     module_path = Path(__file__).resolve().parents[1] / relative_path
+    source_dir = str(module_path.parent)
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
     spec = importlib.util.spec_from_file_location(module_name, str(module_path))
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load module from {module_path}")
@@ -254,7 +258,11 @@ def main() -> None:
             for batch in tqdm(dataloader, desc="Predicting chunks", leave=False, unit="batch"):
                 images = batch["image"].to(device)
                 binary_code = model(images)
-                logits = binary_code.mm(codebook_matrix.t())
+                logits = trainmod.codebook_logits(
+                    binary_code,
+                    codebook_matrix,
+                    bool(getattr(prediction_codebook, "structured", False)),
+                )
                 predictions = logits.argmax(dim=1)
 
                 for index in range(images.size(0)):

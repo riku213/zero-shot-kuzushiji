@@ -58,29 +58,6 @@ python src/6_train_model.py ^
 
 事前学習とファインチューニングを実行
 ＜テスト＞
-
-[26/10/04] 部首画像のレンダリング (HanaMinA 優先、無ければ HanaMinB)
-```
-python src/2_render_radicals.py
-```
-画像は `outputs/radical_images/` に出力され、メタデータは `outputs/radical_render_metadata.json` に出力される．
-
-- `schema_version`: スキーマ版数 (1)
-- `run`: 実行条件．`ids_files`，代表フォント `font_path` とその `font_sha256`，`image_size`，`created_at` (UTC, ISO 8601)
-- `summary`: `total` = `rendered` + `missing_glyph` + `blank` + `error`
-- `entries[]`: 部首ごとの結果
-  - `text`, `codepoints`: 文字とコードポイント列
-  - `status`: 判定は次の順
-    - `missing_glyph`: どのフォントの cmap にも全コードポイントが無い (豆腐は描画しない)
-    - `error`: 描画中に例外が発生
-    - `blank`: cmap にあるがインク画素が 0
-    - `rendered`: 画像を保存した
-  - `renderable`: `status == rendered` のとき true
-  - `image_path`: `rendered` のときだけ画像パス．それ以外は `null` (画像は保存しない)
-  - `font_path`: 実際に使ったフォント (A 優先、無ければ B)．`missing_glyph` では A を記載
-  - `bbox`: `[x0, y0, x1, y1]` インク領域．`rendered` 以外は `null`
-  - `ink_pixel_count`: インク画素数
-  - `error`: `glyph_not_supported` または例外メッセージ．正常時は `null`
 ```
 python src/6_train_model.py ^
   --data-root "../kuzushiji-recognition/char_sep_datas" ^
@@ -262,6 +239,73 @@ python src/7_train_model_multiscale_cnn.py ^
   --log-path "outputs/260919_multiscale_patch_cnn/train.log"
 ```
 
+[26/10/05] IDSポーランド記法・4bit構造/64bit部品コードのCodeBookで学習
+
+既存の `outputs/radical_images` は消さず、再レンダリングもしない。保存済みmanifestを使って特徴量と部首コードを新しい実験ディレクトリへ作り直す。
+
+```bat
+python src/3_extract_features.py ^
+  --manifest "outputs/radical_render_manifest.pkl" ^
+  --output "outputs/261005_structured_codebook/radical_features.pkl" ^
+  --batch-size 64 ^
+  --image-size 96 ^
+  --device cuda
+```
+
+```bat
+python src/4_generate_fare.py ^
+  --features "outputs/261005_structured_codebook/radical_features.pkl" ^
+  --manifest "outputs/radical_render_manifest.pkl" ^
+  --output "outputs/261005_structured_codebook/radical_codes.pkl" ^
+  --n-components 64 ^
+  --random-state 42
+```
+
+IDS構造コードを生成する。未登録・描画不能部品はより大きな登録済みIDS部分木へ置換する。解決できない文字は既定でCodeBookから除外し、ランダムコードは使わない。全診断は標準出力と `codebook_build.log` に出る。
+
+```bat
+python src/8_build_structured_codebook.py ^
+  --ids-files "dataset/ids_text/ids.txt" "dataset/ids_text/ids-cdp.txt" ^
+  --radical-codes "outputs/261005_structured_codebook/radical_codes.pkl" ^
+  --render-metadata "outputs/radical_render_metadata.json" ^
+  --render-manifest "outputs/radical_render_manifest.pkl" ^
+  --image-root "outputs/radical_images" ^
+  --class-source-codebook "outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl" ^
+  --max-depth 6 ^
+  --unresolved-policy exclude ^
+  --output "outputs/261005_structured_codebook/final_structured_codebook.pkl" ^
+  --log-path "outputs/261005_structured_codebook/codebook_build.log"
+```
+
+生成したpadding+mask付きCodeBookで、CASIA事前学習20epoch後にくずし字ファインチューニング20epochを実行する。
+
+```bat
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "C:/Users/kotat/MyPrograms/MyKuzushiji/kuzushiji-recognition/CASIA-HWDB" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --pretrain-manifest-path "outputs/manifests/pretrain_manifest.txt" ^
+  --codebook "outputs/261005_structured_codebook/final_structured_codebook.pkl" ^
+  --output-dir "outputs/261005_structured_codebook/training" ^
+  --checkpoint-path "outputs/261005_structured_codebook/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261005_structured_codebook/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261005_structured_codebook/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261005_structured_codebook/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261005_structured_codebook/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261005_structured_codebook/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261005_structured_codebook/training/pretrain_seen_test_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261005_structured_codebook/training/pretrain_unseen_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --log-path "outputs/261005_structured_codebook/training/train.log"
+```
+
+途中再開は上記と同じコマンドを再実行する。`--state-path` と `--pretrain-state-path` を同じままにする。
+
 再開コマンド
 ```
 python src/7_train_model_multiscale_cnn.py ^
@@ -291,3 +335,26 @@ python src/7_train_model_multiscale_cnn.py ^
   --dropout 0.2 ^
   --log-path "outputs/260919_multiscale_patch_cnn/train.log"
 ```
+
+[26/10/04] 部首画像のレンダリング (HanaMinA 優先、無ければ HanaMinB)
+```
+python src/2_render_radicals.py
+```
+画像は `outputs/radical_images/` に出力され、メタデータは `outputs/radical_render_metadata.json` に出力される．
+
+- `schema_version`: スキーマ版数 (1)
+- `run`: 実行条件．`ids_files`，代表フォント `font_path` とその `font_sha256`，`image_size`，`created_at` (UTC, ISO 8601)
+- `summary`: `total` = `rendered` + `missing_glyph` + `blank` + `error`
+- `entries[]`: 部首ごとの結果
+  - `text`, `codepoints`: 文字とコードポイント列
+  - `status`: 判定は次の順
+    - `missing_glyph`: どのフォントの cmap にも全コードポイントが無い (豆腐は描画しない)
+    - `error`: 描画中に例外が発生
+    - `blank`: cmap にあるがインク画素が 0
+    - `rendered`: 画像を保存した
+  - `renderable`: `status == rendered` のとき true
+  - `image_path`: `rendered` のときだけ画像パス．それ以外は `null` (画像は保存しない)
+  - `font_path`: 実際に使ったフォント (A 優先、無ければ B)．`missing_glyph` では A を記載
+  - `bbox`: `[x0, y0, x1, y1]` インク領域．`rendered` 以外は `null`
+  - `ink_pixel_count`: インク画素数
+  - `error`: `glyph_not_supported` または例外メッセージ．正常時は `null`
