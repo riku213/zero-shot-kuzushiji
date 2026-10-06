@@ -358,3 +358,68 @@ python src/2_render_radicals.py
   - `bbox`: `[x0, y0, x1, y1]` インク領域．`rendered` 以外は `null`
   - `ink_pixel_count`: インク画素数
   - `error`: `glyph_not_supported` または例外メッセージ．正常時は `null`
+
+[26/10/07] CASIA + くずし字クラス和集合から1212次元構造CodeBookを作成
+
+この手順は新しい正UTF-8展開済みCASIAを使い、旧CASIA CodeBookによるクラス制限はしない。出力はすべて `outputs/261007_correct_dict` に保存する。CASIAクラスラベルはTrain/Test直下の各ラベルフォルダー名、サンプルはフォルダー内の数字.pngとする。既存の部首画像は削除・再生成しない。
+
+```bat
+conda activate kuzushiji
+```
+
+CASIAとくずし字のクラス和集合を作成し、IDSにないクラス文字を追加レンダリングする。CASIA Train/Testのラベル集合不一致、同一ラベルへのフォルダー衝突、想定外のファイル配置があれば停止する。
+
+```bat
+python src/9_prepare_correct_codebook_assets.py ^
+  --casia-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --kuzushiji-root "../kuzushiji-recognition/char_sep_datas" ^
+  --ids-files "dataset/ids_text/ids.txt" "dataset/ids_text/ids-cdp.txt" ^
+  --radical-codes "outputs/261005_structured_codebook/radical_codes.pkl" ^
+  --render-manifest "outputs/radical_render_manifest.pkl" ^
+  --render-metadata "outputs/radical_render_metadata.json" ^
+  --fonts "dataset/fonts/HanaMinA.ttf" "dataset/fonts/HanaMinB.ttf" ^
+  --output-dir "outputs/261007_correct_dict"
+```
+
+既存の部首画像とIDS未登録クラスの追加画像を合わせてResNet-34特徴を抽出する。
+
+```bat
+python src/3_extract_features.py ^
+  --manifest "outputs/261007_correct_dict/combined_render_manifest.pkl" ^
+  --output "outputs/261007_correct_dict/all_glyph_features.pkl" ^
+  --batch-size 64 ^
+  --image-size 96 ^
+  --device cuda
+```
+
+全画像特徴を同じUMAP空間に写像し、64次元±1の部首・追加文字コード辞書を作る。描画不能画像に対するランダムコードは生成しない。
+
+```bat
+python src/4_generate_fare.py ^
+  --features "outputs/261007_correct_dict/all_glyph_features.pkl" ^
+  --manifest "outputs/261007_correct_dict/combined_render_manifest.pkl" ^
+  --output "outputs/261007_correct_dict/all_glyph_codes.pkl" ^
+  --n-components 64 ^
+  --random-state 42
+```
+
+IDSポーランド記法の4bit構造コードと64bit部品コードを連結し、1212次元にpaddingする。maskでpaddingを分類スコア計算から除外する。1212bitを超えるクラスがあれば生成を中止して対象一覧を出力する。解決不能なクラスはランダムコードにせず診断付きで除外する。
+
+```bat
+python src/8_build_structured_codebook.py ^
+  --ids-files "dataset/ids_text/ids.txt" "dataset/ids_text/ids-cdp.txt" ^
+  --radical-codes "outputs/261007_correct_dict/all_glyph_codes.pkl" ^
+  --render-metadata "outputs/261007_correct_dict/combined_render_metadata.json" ^
+  --render-manifest "outputs/261007_correct_dict/combined_render_manifest.pkl" ^
+  --image-root "outputs/261007_correct_dict" ^
+  --class-union-manifest "outputs/261007_correct_dict/class_union_audit.json" ^
+  --max-depth 6 ^
+  --codebook-dim 1212 ^
+  --unresolved-policy exclude ^
+  --output "outputs/261007_correct_dict/final_codebook_1212.pkl" ^
+  --log-path "outputs/261007_correct_dict/codebook_build.log"
+```
+
+生成物: `class_union_audit.json`（クラス出所とCASIA split別サンプル数）、`union_character_render_*`（IDS未登録文字の画像・描画metadata）、`all_glyph_features.pkl`、`all_glyph_codes.pkl`、`final_codebook_1212.pkl/.json`、`codebook_build.log`。
+
+2026-10-07の実行結果: CASIA 7,330クラス、くずし字4,328クラス、共通2,445クラス、和集合9,213クラス。IDS未登録306文字のうち286文字を追加レンダリングし、残り20文字は既存の画像由来コードで表現した。最終CodeBookは1212次元固定で9,207クラスを生成、1212bit超過0、IDS部品解決不能で除外6クラス。
