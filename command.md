@@ -359,6 +359,50 @@ python src/2_render_radicals.py
   - `ink_pixel_count`: インク画素数
   - `error`: `glyph_not_supported` または例外メッセージ．正常時は `null`
 
+  [26/10/07] 正しい1212次元CodeBookで事前学習・ファインチューニング
+
+  修正点: CASIAのフォルダー名は `class_union_audit.json` の明示対応でUnicodeクラスへ変換する。数字クラスと記号別名も対象。事前学習manifestは公式Trainからのみ作り、公式Testは独立manifestで最終評価だけに使う。validation/testはそれぞれseenサンプルとunseenクラスを分ける。未解決6クラスはCodeBookにないためskipされる。
+
+  初回実行（新しいmanifest・checkpoint/state出力先を使う）
+  ```bat
+  conda activate kuzushiji
+  python src/6_train_model.py ^
+    --data-root "../kuzushiji-recognition/char_sep_datas" ^
+    --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+    --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+    --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+    --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+    --manifest-path "outputs/manifests/main_manifest.txt" ^
+    --codebook "outputs/261007_correct_dict/final_codebook_1212.pkl" ^
+    --output-dir "outputs/261007_correct_dict/training" ^
+    --checkpoint-path "outputs/261007_correct_dict/training/best_fare_model.pth" ^
+    --pretrain-checkpoint-path "outputs/261007_correct_dict/training/pretrain_best_fare_model.pth" ^
+    --state-path "outputs/261007_correct_dict/training/training_state.pth" ^
+    --pretrain-state-path "outputs/261007_correct_dict/training/pretrain_training_state.pth" ^
+    --metadata-path "outputs/261007_correct_dict/training/run_metadata.json" ^
+    --pretrain-split-manifest-train "outputs/261007_correct_dict/training/pretrain_train_manifest.txt" ^
+    --pretrain-split-manifest-val-seen "outputs/261007_correct_dict/training/pretrain_val_seen_manifest.txt" ^
+    --pretrain-split-manifest-val-unseen "outputs/261007_correct_dict/training/pretrain_val_unseen_manifest.txt" ^
+    --pretrain-split-manifest-seen-test "outputs/261007_correct_dict/training/pretrain_test_seen_manifest.txt" ^
+    --pretrain-split-manifest-unseen-test "outputs/261007_correct_dict/training/pretrain_test_unseen_manifest.txt" ^
+    --finetune-split-manifest-train "outputs/261007_correct_dict/training/finetune_train_manifest.txt" ^
+    --finetune-split-manifest-val "outputs/261007_correct_dict/training/finetune_validation_manifest.txt" ^
+    --finetune-split-manifest-test "outputs/261007_correct_dict/training/finetune_test_manifest.txt" ^
+    --pretrain-train-class-ratio 0.8 ^
+    --pretrain-seen-train-ratio 0.8 ^
+    --finetune-train-class-ratio 0.8 ^
+    --train-ratio 0.8 ^
+    --validation-sample-ratio 0.5 ^
+    --pretrain-epochs 20 ^
+    --epochs 20 ^
+    --batch-size 32 ^
+    --device cuda ^
+    --build-manifest ^
+    --log-path "outputs/261007_correct_dict/training/train.log"
+  ```
+
+  途中再開は同じコマンドを同じ `--state-path` と `--pretrain-state-path` で再実行する。既存の `outputs/manifests/pretrain_manifest.txt` や `outputs/261005_structured_codebook/training/*state.pth` は旧データ構造・旧CodeBook由来なので流用しない。
+
 [26/10/07] CASIA + くずし字クラス和集合から1212次元構造CodeBookを作成
 
 この手順は新しい正UTF-8展開済みCASIAを使い、旧CASIA CodeBookによるクラス制限はしない。出力はすべて `outputs/261007_correct_dict` に保存する。CASIAクラスラベルはTrain/Test直下の各ラベルフォルダー名、サンプルはフォルダー内の数字.pngとする。既存の部首画像は削除・再生成しない。
@@ -419,6 +463,49 @@ python src/8_build_structured_codebook.py ^
   --output "outputs/261007_correct_dict/final_codebook_1212.pkl" ^
   --log-path "outputs/261007_correct_dict/codebook_build.log"
 ```
+
+生成済みCodeBookを使った事前学習＋ファインチューニング
+
+公式CASIA Trainだけをtrain/validation作成に使い、公式Testは最終評価専用にする。初回は `--build-manifest` を指定し、新しいパスへTrain/Test別manifestを作る。既存の `outputs/manifests/pretrain_manifest.txt` は旧文字化け展開時のmanifestなので使わない。
+
+```bat
+conda activate kuzushiji
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261007_correct_dict/final_codebook_1212.pkl" ^
+  --output-dir "outputs/261007_correct_dict/training" ^
+  --checkpoint-path "outputs/261007_correct_dict/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261007_correct_dict/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261007_correct_dict/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261007_correct_dict/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261007_correct_dict/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261007_correct_dict/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261007_correct_dict/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261007_correct_dict/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261007_correct_dict/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261007_correct_dict/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261007_correct_dict/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261007_correct_dict/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261007_correct_dict/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --build-manifest ^
+  --log-path "outputs/261007_correct_dict/training/train.log"
+```
+
+途中再開は同じコマンドを再実行し、stateとmanifestのパスを変えない。新CodeBookは1212次元のため、旧CodeBookで作ったcheckpoint/stateは指定しない。
 
 生成物: `class_union_audit.json`（クラス出所とCASIA split別サンプル数）、`union_character_render_*`（IDS未登録文字の画像・描画metadata）、`all_glyph_features.pkl`、`all_glyph_codes.pkl`、`final_codebook_1212.pkl/.json`、`codebook_build.log`。
 
