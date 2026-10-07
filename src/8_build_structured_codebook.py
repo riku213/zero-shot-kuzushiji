@@ -41,9 +41,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-manifest", default="outputs/radical_render_manifest.pkl")
     parser.add_argument("--image-root", default="outputs/radical_images")
     parser.add_argument(
+        "--class-union-manifest",
+        default=None,
+        help="Audit JSON produced by 9_prepare_correct_codebook_assets.py; its classes define the complete source union.",
+    )
+    parser.add_argument(
         "--class-source-codebook",
-        default="outputs/260901_codebook_CASIA/final_codebook_with_casia.pkl",
-        help="Optional existing codebook whose Unicode keys define classes to include.",
+        default=None,
+        help="Legacy optional source of Unicode classes. Prefer --class-union-manifest.",
     )
     parser.add_argument("--dataset-root", default=None, help="Optional structured dataset root to include classes from.")
     parser.add_argument("--pretrain-root", default=None, help="Optional pretraining dataset root to include classes from.")
@@ -62,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Maximum IDS tree depth, with the root at depth 1.",
+    )
+    parser.add_argument(
+        "--codebook-dim",
+        type=int,
+        default=1212,
+        help="Fixed padded output dimension. Any class exceeding this length aborts generation and is listed.",
     )
     parser.add_argument(
         "--unresolved-policy",
@@ -280,7 +291,12 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
     ids_files = [Path(path) for path in args.ids_files]
     merged = merge_ids_entries(read_ids_entries(ids_files))
     selected_classes: set[str] = set()
-    if args.class_source_codebook:
+    class_provenance: dict[str, dict[str, Any]] = {}
+    if args.class_union_manifest:
+        union_audit = json.loads(Path(args.class_union_manifest).read_text(encoding="utf-8"))
+        class_provenance = {str(key): value for key, value in union_audit.get("classes", {}).items()}
+        selected_classes = set(class_provenance)
+    elif args.class_source_codebook:
         selected_classes |= read_class_source(Path(args.class_source_codebook))
     if args.dataset_root:
         selected_classes |= collect_structured_dataset_classes(Path(args.dataset_root))
@@ -294,6 +310,12 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
         for character, expression in merged.items()
         if unicode_key(character) in selected_classes
     }
+    if class_provenance:
+        for key in sorted(selected_classes - set(class_entries)):
+            item = class_provenance[key]
+            character = str(item.get("character", ""))
+            if len(character) == 1:
+                class_entries[key] = (character, character)
 
     parsed_ids: dict[str, IDSNode] = {}
     parse_errors: list[dict[str, str]] = []
@@ -413,7 +435,10 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
         try:
             tree = parsed_ids.get(character)
             if tree is None:
-                tree = parse_ids_expression(expression)
+                if character in eligible_codes:
+                    tree = IDSNode(character)
+                else:
+                    tree = parse_ids_expression(expression)
             vector, error = encode_node(tree, character, 1)
         except ValueError as exc:
             vector, error = None, str(exc)
@@ -455,12 +480,29 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
             "ids": expression,
             "polish": ids_to_polish(tree),
             "bit_length": len(vector),
+            "source": class_provenance.get(unicode_class, {}).get("source"),
+            "casia_train_samples": class_provenance.get(unicode_class, {}).get("casia_train_samples"),
+            "casia_test_samples": class_provenance.get(unicode_class, {}).get("casia_test_samples"),
         }
 
     if not resolved_vectors:
         raise RuntimeError("No classes could be encoded. Review IDS, render metadata, and radical codes.")
 
-    max_code_length = max(map(len, resolved_vectors.values()))
+    observed_max_code_length = max(map(len, resolved_vectors.values()))
+    overlength = [
+        {"unicode": key, "character": class_metadata[key]["character"], "bit_length": len(vector), "ids": class_metadata[key]["ids"]}
+        for key, vector in resolved_vectors.items()
+        if len(vector) > args.codebook_dim
+    ]
+    if overlength:
+        overlength_path = Path(args.output).with_name("codebook_overlength_classes.json")
+        overlength_path.parent.mkdir(parents=True, exist_ok=True)
+        overlength_path.write_text(json.dumps(overlength, ensure_ascii=False, indent=2), encoding="utf-8")
+        raise ValueError(
+            f"{len(overlength)} classes exceed the fixed {args.codebook_dim}-bit limit "
+            f"(observed maximum {observed_max_code_length}); details saved to {overlength_path}."
+        )
+    max_code_length = args.codebook_dim
     codes: dict[str, list[int]] = {}
     masks: dict[str, list[bool]] = {}
     for key, vector in resolved_vectors.items():
@@ -484,6 +526,7 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
         "padding_mask_semantics": "true_is_valid_code_bit",
         "score_normalization": "masked_dot_product_scaled_to_64_valid_bits",
         "max_code_length": max_code_length,
+        "observed_max_code_length": observed_max_code_length,
         "codes": codes,
         "masks": masks,
         "lengths": {key: len(value) for key, value in resolved_vectors.items()},
@@ -497,6 +540,9 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
         "build": {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "requested_classes": len(selected_classes),
+            "class_union_manifest": str(Path(args.class_union_manifest).as_posix()) if args.class_union_manifest else None,
+            "codebook_dimension": args.codebook_dim,
+            "observed_max_code_length": observed_max_code_length,
             "resolved_classes": len(codes),
             "unresolved_classes": unresolved_excluded,
             "random_fallback_classes": diagnostic_counts.get("random_fallback_class", 0),
