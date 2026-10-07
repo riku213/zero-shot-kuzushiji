@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-components", type=int, default=64, help="UMAP target dimension.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for deterministic output.")
+    parser.add_argument(
+        "--random-alien-codes",
+        action="store_true",
+        help="Explicitly assign random codes to unrenderable radicals. Disabled by default.",
+    )
     return parser.parse_args()
 
 
@@ -106,20 +111,21 @@ def main() -> None:
             )
         )
 
-    for record in alien_records:
-        fare_code = build_unique_binary_code(existing_codes, rng, length=args.n_components)
-        payload_records.append(
-            FareCodeRecord(
-                radical=record["radical"],
-                codepoint=record["codepoint"],
-                image_path=record["image_path"],
-                renderable=False,
-                feature=record["feature"],
-                projected=[float(value) for value in fare_code],
-                fare_code=fare_code,
-                source="random_alien",
+    if args.random_alien_codes:
+        for record in alien_records:
+            fare_code = build_unique_binary_code(existing_codes, rng, length=args.n_components)
+            payload_records.append(
+                FareCodeRecord(
+                    radical=record["radical"],
+                    codepoint=record["codepoint"],
+                    image_path=record["image_path"],
+                    renderable=False,
+                    feature=record["feature"],
+                    projected=[float(value) for value in fare_code],
+                    fare_code=fare_code,
+                    source="random_alien",
+                )
             )
-        )
 
     payload_records.sort(key=lambda item: item.radical)
     payload = {
@@ -131,6 +137,7 @@ def main() -> None:
     }
     save_pickle_and_json(payload, Path(args.output))
     print(f"Generated {len(payload_records)} FaRE codes to {Path(args.output).resolve()}")
+    print(f"Skipped unrenderable radicals without random codes: {len(alien_records) if not args.random_alien_codes else 0}")
 
 
 if __name__ == "__main__":
