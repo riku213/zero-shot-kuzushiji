@@ -47,10 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--image-size", type=int, default=96, help="Input image size.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--weights", default=None, help="Fine-tuned backbone state_dict from 3a_finetune_resnet_supcon.py.")
+    parser.add_argument("--center", action="store_true", help="Subtract the mean feature over all radicals.")
     return parser.parse_args()
 
 
-def build_feature_extractor(device: torch.device) -> nn.Module:
+def build_feature_extractor(device: torch.device, weights_path: str | None = None) -> nn.Module:
     try:
         weights = models.ResNet34_Weights.DEFAULT
         backbone = models.resnet34(weights=weights)
@@ -58,6 +60,8 @@ def build_feature_extractor(device: torch.device) -> nn.Module:
         backbone = models.resnet34(pretrained=True)
 
     feature_extractor = nn.Sequential(*list(backbone.children())[:-1])
+    if weights_path:
+        feature_extractor.load_state_dict(torch.load(weights_path, map_location="cpu"))
     feature_extractor.eval()
     feature_extractor.to(device)
     return feature_extractor
@@ -71,7 +75,7 @@ def main() -> None:
 
     dataset = RadicalImageDataset(rendered_radicals, image_size=args.image_size)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    extractor = build_feature_extractor(device)
+    extractor = build_feature_extractor(device, args.weights)
 
     feature_records: list[RadicalFeatureRecord] = []
     for batch in dataloader:
@@ -90,6 +94,12 @@ def main() -> None:
                     feature=feature_vector,
                 )
             )
+
+    if args.center and feature_records:
+        matrix = torch.tensor([record.feature for record in feature_records])
+        centered = matrix - matrix.mean(dim=0, keepdim=True)
+        for record, vector in zip(feature_records, centered):
+            record.feature = vector.tolist()
 
     payload = {
         "source_manifest": str(Path(args.manifest).resolve()),
