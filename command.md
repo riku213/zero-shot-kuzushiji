@@ -510,3 +510,41 @@ python src/6_train_model.py ^
 生成物: `class_union_audit.json`（クラス出所とCASIA split別サンプル数）、`union_character_render_*`（IDS未登録文字の画像・描画metadata）、`all_glyph_features.pkl`、`all_glyph_codes.pkl`、`final_codebook_1212.pkl/.json`、`codebook_build.log`。
 
 2026-10-07の実行結果: CASIA 7,330クラス、くずし字4,328クラス、共通2,445クラス、和集合9,213クラス。IDS未登録306文字のうち286文字を追加レンダリングし、残り20文字は既存の画像由来コードで表現した。最終CodeBookは1212次元固定で9,207クラスを生成、1212bit超過0、IDS部品解決不能で除外6クラス。
+
+チューニングしたモデルでLSTM学習
+```
+conda activate kuzushiji
+python src/6_train_model.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261010_tuned_codebook/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261010_tuned_codebook/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261010_tuned_codebook/final_codebook_1212.pkl" ^
+  --output-dir "outputs/261010_tuned_codebook/training" ^
+  --checkpoint-path "outputs/261010_tuned_codebook/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261010_tuned_codebook/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261010_tuned_codebook/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261010_tuned_codebook/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261010_tuned_codebook/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261010_tuned_codebook/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261010_tuned_codebook/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261010_tuned_codebook/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261010_tuned_codebook/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261010_tuned_codebook/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261010_tuned_codebook/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261010_tuned_codebook/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261010_tuned_codebook/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --build-manifest ^
+  --log-path "outputs/261010_tuned_codebook/training/train.log"
+```
