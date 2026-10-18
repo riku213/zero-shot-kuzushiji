@@ -62,6 +62,7 @@ def load_payload(input_path: Path, inventory_path: Path) -> tuple[list[dict[str,
                 "is_component": radical_set is None or str(record["radical"]) in radical_set,
                 "feature": record.get("feature"),
                 "code": record.get("fare_code"),
+                "projected": record.get("projected"),
             }
         )
     if len(normalized_records) < 2:
@@ -208,8 +209,12 @@ def make_html(
 
 
 def terminal_search(records: list[dict[str, Any]], features: np.ndarray, codes: np.ndarray, neighbors: int, all_glyphs: bool) -> None:
+    if any(record["projected"] is None for record in records):
+        raise ValueError("Every record must contain 'projected' (UMAP 64-dimensional vector).")
+    projected = np.asarray([record["projected"] for record in records], dtype=np.float32)
     norms = np.linalg.norm(features, axis=1)
     normalized = features / np.maximum(norms[:, None], 1e-12)
+    projected_normalized = projected / np.maximum(np.linalg.norm(projected, axis=1, keepdims=True), 1e-12)
     allowed = np.ones(len(records), dtype=bool) if all_glyphs else np.asarray(
         [record["is_component"] for record in records], dtype=bool
     )
@@ -234,10 +239,13 @@ def terminal_search(records: list[dict[str, Any]], features: np.ndarray, codes: 
 
         target = records[index]
         source_scores = normalized @ normalized[index]
+        projected_distances = np.linalg.norm(projected - projected[index], axis=1)
+        projected_cosine = projected_normalized @ projected_normalized[index]
         hamming_distances = np.count_nonzero(codes != codes[index], axis=1)
         candidates = np.flatnonzero(allowed)
         candidates = candidates[candidates != index]
         source_order = candidates[np.argsort(-source_scores[candidates], kind="stable")[:neighbors]]
+        projected_order = candidates[np.argsort(projected_distances[candidates], kind="stable")[:neighbors]]
         code_order = candidates[np.argsort(hamming_distances[candidates], kind="stable")[:neighbors]]
 
         print(f"\n対象: {target['glyph']} ({target['codepoint']})")
@@ -246,7 +254,14 @@ def terminal_search(records: list[dict[str, Any]], features: np.ndarray, codes: 
         for rank, candidate in enumerate(source_order, start=1):
             record = records[int(candidate)]
             print(f"{rank:2d}. {record['glyph']}  {record['codepoint']}  cosine={source_scores[candidate]:.5f}")
-        print("\n[64ビットFaREコード: Hamming距離 小さい順]")
+        print("\n[UMAP 64次元(二値化前): ユークリッド距離 小さい順]")
+        for rank, candidate in enumerate(projected_order, start=1):
+            record = records[int(candidate)]
+            print(
+                f"{rank:2d}. {record['glyph']}  {record['codepoint']}  "
+                f"euclid={projected_distances[candidate]:.5f}  cosine={projected_cosine[candidate]:.5f}"
+            )
+        print("\n[64ビットFaREコード(二値化後): Hamming距離 小さい順]")
         for rank, candidate in enumerate(code_order, start=1):
             record = records[int(candidate)]
             distance = int(hamming_distances[candidate])

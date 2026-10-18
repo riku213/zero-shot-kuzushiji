@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-components", type=int, default=64, help="UMAP target dimension.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for deterministic output.")
+    parser.add_argument("--metric", default="euclidean", help="UMAP distance metric, e.g. euclidean or cosine.")
     parser.add_argument(
         "--random-alien-codes",
         action="store_true",
@@ -80,7 +81,7 @@ def main() -> None:
     reducer = UMAP(
         n_components=args.n_components,
         n_neighbors=n_neighbors,
-        metric="euclidean",
+        metric=args.metric,
         random_state=args.random_state,
         transform_seed=args.random_state,
         init="random",
