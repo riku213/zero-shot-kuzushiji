@@ -11,9 +11,9 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "outputs/261007_correct_dict/all_glyph_codes.pkl"
+DEFAULT_INPUT = ROOT / "outputs/261010_tuned_codebook/all_glyph_codes.pkl"
 DEFAULT_INVENTORY = ROOT / "outputs/radical_inventory.pkl"
-DEFAULT_OUTPUT = ROOT / "outputs/261007_correct_dict/glyph_neighbors.html"
+DEFAULT_OUTPUT = ROOT / "outputs/261010_tuned_codebook/glyph_neighbors.html"
 DEFAULT_FONT = ROOT / "dataset/fonts/HanaMinA.ttf"
 
 
@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--font", type=Path, default=DEFAULT_FONT)
     parser.add_argument("--neighbors", type=int, default=12, help="Neighbors shown for each representation.")
     parser.add_argument("--batch-size", type=int, default=128, help="Query rows processed at once.")
+    parser.add_argument("--interactive", action="store_true", help="Compare glyph neighbors in the terminal.")
+    parser.add_argument("--all-glyphs", action="store_true", help="Include additional whole-character records in terminal results.")
     return parser.parse_args()
 
 
@@ -205,16 +207,68 @@ def make_html(
     output_path.write_text(html, encoding="utf-8")
 
 
+def terminal_search(records: list[dict[str, Any]], features: np.ndarray, codes: np.ndarray, neighbors: int, all_glyphs: bool) -> None:
+    norms = np.linalg.norm(features, axis=1)
+    normalized = features / np.maximum(norms[:, None], 1e-12)
+    allowed = np.ones(len(records), dtype=bool) if all_glyphs else np.asarray(
+        [record["is_component"] for record in records], dtype=bool
+    )
+    lookup: dict[str, int] = {}
+    for index, record in enumerate(records):
+        lookup.setdefault(record["glyph"].casefold(), index)
+        lookup.setdefault(record["codepoint"].casefold(), index)
+
+    print("文字またはU+XXXXを入力してください。終了するには q を入力します。", flush=True)
+    while True:
+        try:
+            query = input("検索文字> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if query.casefold() in {"q", "quit", "exit"}:
+            return
+        index = lookup.get(query.casefold())
+        if index is None:
+            print(f"見つかりません: {query}\n", flush=True)
+            continue
+
+        target = records[index]
+        source_scores = normalized @ normalized[index]
+        hamming_distances = np.count_nonzero(codes != codes[index], axis=1)
+        candidates = np.flatnonzero(allowed)
+        candidates = candidates[candidates != index]
+        source_order = candidates[np.argsort(-source_scores[candidates], kind="stable")[:neighbors]]
+        code_order = candidates[np.argsort(hamming_distances[candidates], kind="stable")[:neighbors]]
+
+        print(f"\n対象: {target['glyph']} ({target['codepoint']})")
+        print(f"表示対象: {'全レコード' if all_glyphs else 'IDS構成要素'} / 上位{neighbors}件")
+        print("\n[元特徴: cosine類似度 高い順]")
+        for rank, candidate in enumerate(source_order, start=1):
+            record = records[int(candidate)]
+            print(f"{rank:2d}. {record['glyph']}  {record['codepoint']}  cosine={source_scores[candidate]:.5f}")
+        print("\n[64ビットFaREコード: Hamming距離 小さい順]")
+        for rank, candidate in enumerate(code_order, start=1):
+            record = records[int(candidate)]
+            distance = int(hamming_distances[candidate])
+            print(f"{rank:2d}. {record['glyph']}  {record['codepoint']}  Hamming={distance}/64")
+        print(flush=True)
+
+
 def main() -> None:
     args = parse_args()
-    input_path, inventory_path, output_path, font_path = map(
-        resolve_path, (args.input, args.inventory, args.output, args.font)
-    )
-    for path in (input_path, font_path):
-        if not path.is_file():
-            raise FileNotFoundError(path)
+    input_path = resolve_path(args.input)
+    inventory_path = resolve_path(args.inventory)
+    output_path = resolve_path(args.output)
+    font_path = resolve_path(args.font)
+    if not input_path.is_file():
+        raise FileNotFoundError(input_path)
     records, features, codes = load_payload(input_path, inventory_path)
     print(f"Loaded {len(records):,} glyphs: source features {features.shape[1]}D, FaRE codes {codes.shape[1]}D.", flush=True)
+    if args.interactive:
+        terminal_search(records, features, codes, args.neighbors, args.all_glyphs)
+        return
+    if not font_path.is_file():
+        raise FileNotFoundError(font_path)
     component_mask = np.asarray([record["is_component"] for record in records], dtype=bool)
     source_neighbors, code_neighbors, source_component_neighbors, code_component_neighbors = nearest_tables(
         features, codes, component_mask, args.neighbors, args.batch_size
