@@ -73,8 +73,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pretrain-manifest-path",
-        default="outputs/manifests/pretrain_manifest.txt",
-        help="Optional path to a manifest file (one image path per line) for the pretraining dataset.",
+        default="outputs/261007_correct_dict/training/casia_train_manifest.txt",
+        help="Manifest containing CASIA official Train images only.",
+    )
+    parser.add_argument(
+        "--pretrain-test-manifest-path",
+        default="outputs/261007_correct_dict/training/casia_test_manifest.txt",
+        help="Manifest containing CASIA official Test images only; used only for final evaluation.",
+    )
+    parser.add_argument(
+        "--pretrain-label-map",
+        default="outputs/261007_correct_dict/class_union_audit.json",
+        help="Class-union audit mapping CASIA label folder names to CodeBook Unicode keys.",
     )
     parser.add_argument(
         "--build-manifest",
@@ -83,7 +93,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size for training and validation.")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Train split ratio for each class.")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="Training-sample fraction within each seen fine-tuning class.")
+    parser.add_argument(
+        "--finetune-train-class-ratio",
+        type=float,
+        default=0.8,
+        help="Fraction of Kuzushiji classes available during fine-tuning; remaining classes are unseen evaluation classes.",
+    )
+    parser.add_argument(
+        "--validation-sample-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of held-out samples assigned to validation rather than final test.",
+    )
     parser.add_argument("--image-size", type=int, default=96, help="Input image size (aligned with the FaRE render size).")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Training device.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -116,13 +138,13 @@ def parse_args() -> argparse.Namespace:
         "--pretrain-train-class-ratio",
         type=float,
         default=0.8,
-        help="Ratio of pretraining classes to use as training classes (remaining classes become unseen test classes).",
+        help="Ratio of official CASIA Train classes to expose during pretraining; remaining classes are held out from training.",
     )
     parser.add_argument(
         "--pretrain-seen-train-ratio",
         type=float,
         default=0.8,
-        help="Within training classes, ratio of samples used for training (remaining are seen test samples).",
+        help="Within seen pretraining classes, fraction of official Train samples used for gradient updates.",
     )
     parser.add_argument(
         "--pretrain-split-manifest-train",
@@ -131,13 +153,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pretrain-split-manifest-seen-test",
-        default="outputs/260913_redefine_train_data/pretrain_seen_test_manifest.txt",
-        help="Output manifest path for pretraining seen test samples.",
+        default="outputs/261007_correct_dict/training/pretrain_test_seen_manifest.txt",
+        help="Output manifest for official CASIA Test samples from training classes.",
     )
     parser.add_argument(
         "--pretrain-split-manifest-unseen-test",
-        default="outputs/260913_redefine_train_data/pretrain_unseen_test_manifest.txt",
-        help="Output manifest path for pretraining unseen test samples.",
+        default="outputs/261007_correct_dict/training/pretrain_test_unseen_manifest.txt",
+        help="Output manifest for official CASIA Test samples from classes excluded from pretraining.",
+    )
+    parser.add_argument(
+        "--pretrain-split-manifest-val-seen",
+        default="outputs/261007_correct_dict/training/pretrain_val_seen_manifest.txt",
+        help="Output manifest for validation samples from classes used in pretraining.",
+    )
+    parser.add_argument(
+        "--pretrain-split-manifest-val-unseen",
+        default="outputs/261007_correct_dict/training/pretrain_val_unseen_manifest.txt",
+        help="Output manifest for validation samples from classes excluded from pretraining.",
+    )
+    parser.add_argument(
+        "--finetune-split-manifest-train",
+        default="outputs/261007_correct_dict/training/finetune_train_manifest.txt",
+        help="Output manifest for fine-tuning training samples.",
+    )
+    parser.add_argument(
+        "--finetune-split-manifest-val",
+        default="outputs/261007_correct_dict/training/finetune_validation_manifest.txt",
+        help="Output manifest for fine-tuning validation samples (seen and unseen groups).",
+    )
+    parser.add_argument(
+        "--finetune-split-manifest-test",
+        default="outputs/261007_correct_dict/training/finetune_test_manifest.txt",
+        help="Output manifest for final fine-tuning test samples (seen and unseen groups).",
     )
     parser.add_argument(
         "--log-path",
@@ -258,12 +305,50 @@ def extract_pretrain_candidate_names(image_path: Path) -> list[str]:
     return candidates
 
 
-def resolve_pretrain_true_label(image_path: Path, codebook: dict[str, np.ndarray], allowed_keys: set[str]) -> str | None:
+def load_pretrain_folder_label_map(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    folder_to_key: dict[str, str] = {}
+    for unicode_key, entry in payload.get("classes", {}).items():
+        if not isinstance(entry, dict) or not entry.get("source", {}).get("casia"):
+            continue
+        folder_name = entry.get("casia_folder_name")
+        if folder_name is None:
+            continue
+        existing = folder_to_key.get(str(folder_name))
+        if existing is not None and existing != str(unicode_key):
+            raise ValueError(f"CASIA folder label {folder_name!r} maps to multiple Unicode classes.")
+        folder_to_key[str(folder_name)] = str(unicode_key)
+    return folder_to_key
+
+
+def resolve_pretrain_true_label(
+    image_path: Path,
+    codebook: dict[str, np.ndarray],
+    allowed_keys: set[str],
+    folder_label_map: dict[str, str] | None = None,
+) -> str | None:
+    if folder_label_map:
+        mapped = folder_label_map.get(image_path.parent.name)
+        if mapped is not None:
+            return mapped if mapped in allowed_keys else None
+
     for candidate in extract_pretrain_candidate_names(image_path):
         resolved = resolve_codebook_label(candidate, codebook)
         if resolved is not None and resolved in allowed_keys:
             return resolved
     return None
+
+
+def casia_split_roots(data_root: Path) -> tuple[Path, Path | None]:
+    train_root = data_root / "CASIA-HWDB_Train" / "Train"
+    test_root = data_root / "CASIA-HWDB_Test" / "Test"
+    if train_root.is_dir():
+        return train_root, test_root if test_root.is_dir() else None
+    return data_root, None
 
 
 def write_manifest(entries: list[dict[str, Any]], path: Path) -> None:
@@ -523,7 +608,9 @@ def collect_pretrain_entries_with_redefined_split(
     max_classes: int | None = None,
     max_samples_per_class: int | None = None,
     manifest_path: Path | None = None,
-) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    test_manifest_path: Path | None = None,
+    folder_label_map: dict[str, str] | None = None,
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if not data_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {data_root}")
     if not 0.0 < train_class_ratio < 1.0:
@@ -533,72 +620,99 @@ def collect_pretrain_entries_with_redefined_split(
 
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
     allowed_keys = {str(key) for key in codebook if is_valid_unicode_codebook_key(str(key))}
-    class_samples: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    train_root, official_test_root = casia_split_roots(data_root)
+    if not train_root.is_dir():
+        raise FileNotFoundError(f"CASIA official Train directory not found: {train_root}")
 
-    def iter_paths_from_manifest(path: Path):
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                p = Path(line.strip())
-                if p and p.suffix.lower() in image_extensions:
-                    yield p
+    def paths_for(root: Path, path: Path | None, description: str):
+        if path is not None and path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    image_path = Path(text)
+                    if not image_path.is_absolute():
+                        image_path = Path.cwd() / image_path
+                    try:
+                        image_path.resolve().relative_to(root.resolve())
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Manifest {path} line {line_number} points outside {description}: {image_path}. "
+                            "Create a fresh manifest for the corrected dataset split."
+                        ) from exc
+                    if not image_path.is_file():
+                        raise FileNotFoundError(
+                            f"Manifest {path} line {line_number} points to a missing image: {image_path}. "
+                            "Create a fresh manifest; old manifests are not reused after extraction changes."
+                        )
+                    if image_path.suffix.lower() in image_extensions:
+                        yield image_path
+        else:
+            yield from root.rglob("*")
 
-    iterator = None
-    if manifest_path is not None and manifest_path.exists():
-        iterator = iter_paths_from_manifest(manifest_path)
-        iterator = tqdm(iterator, desc=f"Reading manifest {manifest_path.name}", unit="img")
-    else:
-        iterator = data_root.rglob("*")
-        iterator = tqdm(iterator, desc=f"Scanning {data_root}", unit="path")
+    train_class_samples: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    test_class_samples: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    split_stats: dict[str, dict[str, int]] = {}
 
-    total_images = 0
-    unresolved_images = 0
-    invalid_label_images = 0
-
-    for image_path in iterator:
-        if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
+    for split_name, split_root, split_manifest, target in (
+        ("official_train", train_root, manifest_path, train_class_samples),
+        ("official_test", official_test_root, test_manifest_path, test_class_samples),
+    ):
+        if split_root is None or not split_root.is_dir():
+            split_stats[split_name] = {"total_images": 0, "resolved_images": 0, "unresolved_images": 0}
             continue
-        total_images += 1
+        total_images = 0
+        resolved_images = 0
+        unresolved_images = 0
+        iterator = paths_for(split_root, split_manifest, split_name)
+        description = f"Reading {split_name} manifest {split_manifest.name}" if split_manifest and split_manifest.exists() else f"Scanning {split_root}"
+        for image_path in tqdm(iterator, desc=description, unit="img" if split_manifest and split_manifest.exists() else "path"):
+            if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
+                continue
+            total_images += 1
+            resolved = resolve_pretrain_true_label(image_path, codebook, allowed_keys, folder_label_map)
+            if resolved is None:
+                unresolved_images += 1
+                continue
+            resolved_images += 1
+            if max_samples_per_class is not None and len(target[resolved]) >= max_samples_per_class:
+                continue
+            target[resolved].append(
+                {
+                    "book_id": split_name,
+                    "unicode": resolved,
+                    "image_path": str(image_path),
+                }
+            )
+        split_stats[split_name] = {
+            "total_images": total_images,
+            "resolved_images": resolved_images,
+            "unresolved_images": unresolved_images,
+        }
 
-        resolved = resolve_pretrain_true_label(image_path, codebook, allowed_keys)
-        if resolved is None:
-            unresolved_images += 1
-            continue
-
-        if resolved not in allowed_keys:
-            invalid_label_images += 1
-            continue
-
-        if max_samples_per_class is not None and len(class_samples[resolved]) >= max_samples_per_class:
-            continue
-
-        class_samples[resolved].append(
-            {
-                "book_id": data_root.name,
-                "unicode": resolved,
-                "image_path": str(image_path),
-            }
-        )
-
-    classes = sorted(class_samples.keys(), key=lambda item: str(item))
+    classes = sorted(set(train_class_samples) | set(test_class_samples), key=lambda item: str(item))
     if max_classes is not None:
         classes = classes[:max_classes]
 
     if not classes:
-        return {}, [], [], {
-            "total_images": total_images,
-            "resolved_images": 0,
-            "unresolved_images": unresolved_images,
-            "invalid_label_images": invalid_label_images,
+        return {}, [], [], [], {
+            **split_stats,
             "train_classes": 0,
             "unseen_classes": 0,
-            "seen_test_classes": 0,
+            "val_seen_classes": 0,
+            "val_unseen_classes": 0,
+            "test_seen_classes": 0,
+            "test_unseen_classes": 0,
             "train_samples": 0,
-            "seen_test_samples": 0,
-            "unseen_test_samples": 0,
+            "val_seen_samples": 0,
+            "val_unseen_samples": 0,
+            "test_seen_samples": 0,
+            "test_unseen_samples": 0,
         }
 
-    eligible_seen_classes = [cls for cls in classes if len(class_samples[cls]) >= 2]
-    forced_unseen_classes = [cls for cls in classes if len(class_samples[cls]) < 2]
+    eligible_seen_classes = [cls for cls in classes if len(train_class_samples[cls]) >= 2]
+    forced_unseen_classes = [cls for cls in classes if len(train_class_samples[cls]) < 2]
 
     train_class_set: set[str] = set()
     unseen_class_set: set[str] = set(forced_unseen_classes)
@@ -620,58 +734,67 @@ def collect_pretrain_entries_with_redefined_split(
     class_to_index = {name: idx for idx, name in enumerate(all_split_classes)}
 
     train_entries: list[dict[str, Any]] = []
-    seen_test_entries: list[dict[str, Any]] = []
-    unseen_test_entries: list[dict[str, Any]] = []
+    val_seen_entries: list[dict[str, Any]] = []
+    val_unseen_entries: list[dict[str, Any]] = []
+    test_seen_entries: list[dict[str, Any]] = []
+    test_unseen_entries: list[dict[str, Any]] = []
 
     for cls in tqdm(all_split_classes, desc="Building split", unit="class"):
-        cls_entries = class_samples[cls]
+        cls_entries = train_class_samples[cls]
         if cls in unseen_class_set:
             for entry in cls_entries:
                 item = dict(entry)
                 item["label"] = class_to_index[cls]
-                item["split"] = "unseen_test"
-                unseen_test_entries.append(item)
-            continue
+                item["split"] = "val_unseen"
+                val_unseen_entries.append(item)
+        else:
+            local_train: list[dict[str, Any]] = []
+            local_val: list[dict[str, Any]] = []
+            for entry in cls_entries:
+                if stable_value(seed, "pretrain-sample", cls, entry["image_path"]) < seen_train_ratio:
+                    local_train.append(entry)
+                else:
+                    local_val.append(entry)
+            if not local_val and len(local_train) > 1:
+                local_val.append(local_train.pop())
+            if not local_train and local_val:
+                local_train.append(local_val.pop())
+            for entry in local_train:
+                item = dict(entry)
+                item["label"] = class_to_index[cls]
+                item["split"] = "train"
+                train_entries.append(item)
+            for entry in local_val:
+                item = dict(entry)
+                item["label"] = class_to_index[cls]
+                item["split"] = "val_seen"
+                val_seen_entries.append(item)
 
-        local_train: list[dict[str, Any]] = []
-        local_seen_test: list[dict[str, Any]] = []
-        for entry in cls_entries:
-            if stable_value(seed, "pretrain-sample", cls, entry["image_path"]) < seen_train_ratio:
-                local_train.append(entry)
-            else:
-                local_seen_test.append(entry)
-
-        if not local_seen_test and len(local_train) > 1:
-            local_seen_test.append(local_train.pop())
-        if not local_train and local_seen_test:
-            local_train.append(local_seen_test.pop())
-
-        for entry in local_train:
+        test_group = test_unseen_entries if cls in unseen_class_set else test_seen_entries
+        for entry in test_class_samples[cls]:
             item = dict(entry)
             item["label"] = class_to_index[cls]
-            item["split"] = "train"
-            train_entries.append(item)
-        for entry in local_seen_test:
-            item = dict(entry)
-            item["label"] = class_to_index[cls]
-            item["split"] = "seen_test"
-            seen_test_entries.append(item)
+            item["split"] = "test_unseen" if cls in unseen_class_set else "test_seen"
+            test_group.append(item)
 
-    val_entries = seen_test_entries + unseen_test_entries
+    val_entries = val_seen_entries + val_unseen_entries
+    test_entries = test_seen_entries + test_unseen_entries
     split_summary = {
-        "total_images": total_images,
-        "resolved_images": sum(len(class_samples[c]) for c in all_split_classes),
-        "unresolved_images": unresolved_images,
-        "invalid_label_images": invalid_label_images,
+        **split_stats,
         "train_classes": len(train_class_set),
-        "seen_test_classes": len({entry["unicode"] for entry in seen_test_entries}),
+        "val_seen_classes": len({entry["unicode"] for entry in val_seen_entries}),
+        "val_unseen_classes": len({entry["unicode"] for entry in val_unseen_entries}),
         "unseen_classes": len(unseen_class_set),
+        "test_seen_classes": len({entry["unicode"] for entry in test_seen_entries}),
+        "test_unseen_classes": len({entry["unicode"] for entry in test_unseen_entries}),
         "train_samples": len(train_entries),
-        "seen_test_samples": len(seen_test_entries),
-        "unseen_test_samples": len(unseen_test_entries),
+        "val_seen_samples": len(val_seen_entries),
+        "val_unseen_samples": len(val_unseen_entries),
+        "test_seen_samples": len(test_seen_entries),
+        "test_unseen_samples": len(test_unseen_entries),
     }
 
-    return class_to_index, train_entries, val_entries, split_summary
+    return class_to_index, train_entries, val_entries, test_entries, split_summary
 
 
 class CharacterImageDataset(Dataset):
@@ -771,6 +894,135 @@ def build_split(labels: list[int], train_ratio: float, seed: int) -> tuple[list[
     return train_indices, val_indices
 
 
+def build_seen_unseen_sample_split(
+    entries: list[dict[str, Any]],
+    train_class_ratio: float,
+    train_sample_ratio: float,
+    validation_sample_ratio: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    for name, ratio in (
+        ("finetune_train_class_ratio", train_class_ratio),
+        ("train_ratio", train_sample_ratio),
+        ("validation_sample_ratio", validation_sample_ratio),
+    ):
+        if not 0.0 < ratio < 1.0:
+            raise ValueError(f"{name} must be between 0 and 1.")
+
+    by_class: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        by_class[str(entry["unicode"])].append(entry)
+
+    eligible_seen = sorted(name for name, items in by_class.items() if len(items) >= 3)
+    forced_unseen = set(by_class) - set(eligible_seen)
+    train_class_set = {
+        name for name in eligible_seen if stable_value(seed, "finetune-class", name) < train_class_ratio
+    }
+    unseen_class_set = set(by_class) - train_class_set
+    if eligible_seen and not train_class_set:
+        train_class_set.add(eligible_seen[0])
+        unseen_class_set.discard(eligible_seen[0])
+    if len(eligible_seen) > 1 and not (unseen_class_set - forced_unseen):
+        moved = sorted(train_class_set)[-1]
+        train_class_set.remove(moved)
+        unseen_class_set.add(moved)
+
+    train_entries: list[dict[str, Any]] = []
+    val_entries: list[dict[str, Any]] = []
+    test_entries: list[dict[str, Any]] = []
+    seen_val_classes: set[str] = set()
+    unseen_val_classes: set[str] = set()
+    seen_test_classes: set[str] = set()
+    unseen_test_classes: set[str] = set()
+
+    for class_name, class_entries in by_class.items():
+        if class_name in train_class_set:
+            train_items: list[dict[str, Any]] = []
+            held_items: list[dict[str, Any]] = []
+            for entry in class_entries:
+                target = train_items if stable_value(seed, "finetune-sample", class_name, entry["image_path"]) < train_sample_ratio else held_items
+                target.append(entry)
+            while len(held_items) < 2 and len(train_items) > 1:
+                held_items.append(train_items.pop())
+            if not train_items and held_items:
+                train_items.append(held_items.pop())
+            for entry in train_items:
+                item = dict(entry)
+                item["split"] = "train"
+                train_entries.append(item)
+            for entry in held_items:
+                group = "val_seen" if stable_value(seed, "finetune-val-test", class_name, entry["image_path"]) < validation_sample_ratio else "test_seen"
+                item = dict(entry)
+                item["split"] = group
+                if group == "val_seen":
+                    val_entries.append(item)
+                    seen_val_classes.add(class_name)
+                else:
+                    test_entries.append(item)
+                    seen_test_classes.add(class_name)
+            if len(held_items) >= 2:
+                assigned = [entry for entry in val_entries + test_entries if entry["unicode"] == class_name]
+                assigned_groups = {entry["split"] for entry in assigned}
+                if "val_seen" not in assigned_groups:
+                    move = next(entry for entry in test_entries if entry["unicode"] == class_name)
+                    test_entries.remove(move)
+                    move["split"] = "val_seen"
+                    val_entries.append(move)
+                    seen_val_classes.add(class_name)
+                    seen_test_classes.discard(class_name)
+                elif "test_seen" not in assigned_groups:
+                    move = next(entry for entry in val_entries if entry["unicode"] == class_name)
+                    val_entries.remove(move)
+                    move["split"] = "test_seen"
+                    test_entries.append(move)
+                    seen_test_classes.add(class_name)
+                    seen_val_classes.discard(class_name)
+        else:
+            for entry in class_entries:
+                group = "val_unseen" if stable_value(seed, "finetune-unseen-val-test", class_name, entry["image_path"]) < validation_sample_ratio else "test_unseen"
+                item = dict(entry)
+                item["split"] = group
+                if group == "val_unseen":
+                    val_entries.append(item)
+                    unseen_val_classes.add(class_name)
+                else:
+                    test_entries.append(item)
+                    unseen_test_classes.add(class_name)
+            class_items = [entry for entry in val_entries + test_entries if entry["unicode"] == class_name]
+            if len(class_items) > 1:
+                groups = {entry["split"] for entry in class_items}
+                if "val_unseen" not in groups:
+                    move = next(entry for entry in test_entries if entry["unicode"] == class_name)
+                    test_entries.remove(move)
+                    move["split"] = "val_unseen"
+                    val_entries.append(move)
+                    unseen_val_classes.add(class_name)
+                    unseen_test_classes.discard(class_name)
+                elif "test_unseen" not in groups:
+                    move = next(entry for entry in val_entries if entry["unicode"] == class_name)
+                    val_entries.remove(move)
+                    move["split"] = "test_unseen"
+                    test_entries.append(move)
+                    unseen_test_classes.add(class_name)
+                    unseen_val_classes.discard(class_name)
+
+    summary = {
+        "classes": len(by_class),
+        "train_classes": len(train_class_set),
+        "unseen_classes": len(unseen_class_set),
+        "train_samples": len(train_entries),
+        "val_seen_classes": len(seen_val_classes),
+        "val_seen_samples": sum(entry["split"] == "val_seen" for entry in val_entries),
+        "val_unseen_classes": len(unseen_val_classes),
+        "val_unseen_samples": sum(entry["split"] == "val_unseen" for entry in val_entries),
+        "test_seen_classes": len(seen_test_classes),
+        "test_seen_samples": sum(entry["split"] == "test_seen" for entry in test_entries),
+        "test_unseen_classes": len(unseen_test_classes),
+        "test_unseen_samples": sum(entry["split"] == "test_unseen" for entry in test_entries),
+    }
+    return train_entries, val_entries, test_entries, summary
+
+
 def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
@@ -801,6 +1053,26 @@ def evaluate(
     accuracy = total_correct / max(1, total_seen)
     mean_loss = total_loss / max(1, total_seen)
     return mean_loss, accuracy
+
+
+def evaluate_entries(
+    model: nn.Module,
+    entries: list[dict[str, Any]],
+    codebook: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    structured_codebook: bool,
+) -> tuple[float, float]:
+    dataset = CharacterImageDataset(entries, image_size=96)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+        collate_fn=safe_collate,
+    )
+    return evaluate(model, loader, codebook, device, structured_codebook)
 
 
 def train_model_on_dataset(
@@ -872,6 +1144,7 @@ def train_model_on_dataset(
                 best_state_dict = best_state["state_dict"]
         if best_state_dict is None:
             best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        model.load_state_dict(best_state_dict)
         return best_accuracy, best_epoch
 
     for epoch in range(start_epoch, epochs + 1):
@@ -937,6 +1210,7 @@ def train_model_on_dataset(
     if best_state_dict is None:
         raise RuntimeError("No model checkpoint was saved during training.")
 
+    model.load_state_dict(best_state_dict)
     return best_accuracy, best_epoch
 
 
@@ -965,13 +1239,19 @@ def main() -> None:
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path = Path(args.manifest_path) if getattr(args, "manifest_path", None) else None
         pretrain_manifest_path = Path(args.pretrain_manifest_path) if getattr(args, "pretrain_manifest_path", None) else None
+        pretrain_test_manifest_path = Path(args.pretrain_test_manifest_path) if getattr(args, "pretrain_test_manifest_path", None) else None
 
         # Optionally build manifest files before scanning (can be faster than repeated rglob)
         if args.build_manifest:
             if pretrain_manifest_path and args.pretrain_root:
-                print(f"Building pretrain manifest {pretrain_manifest_path} from {args.pretrain_root}...")
-                n = build_manifest(Path(args.pretrain_root), pretrain_manifest_path)
+                pretrain_train_root, pretrain_test_root = casia_split_roots(Path(args.pretrain_root))
+                print(f"Building CASIA official Train manifest {pretrain_manifest_path} from {pretrain_train_root}...")
+                n = build_manifest(pretrain_train_root, pretrain_manifest_path)
                 print(f"Wrote {n} entries to {pretrain_manifest_path}")
+                if pretrain_test_manifest_path and pretrain_test_root is not None:
+                    print(f"Building CASIA official Test manifest {pretrain_test_manifest_path} from {pretrain_test_root}...")
+                    n = build_manifest(pretrain_test_root, pretrain_test_manifest_path)
+                    print(f"Wrote {n} entries to {pretrain_test_manifest_path}")
             if manifest_path:
                 print(f"Building main manifest {manifest_path} from {args.data_root}...")
                 n = build_manifest(Path(args.data_root), manifest_path)
@@ -996,11 +1276,14 @@ def main() -> None:
         pretrain_class_to_index: dict[str, int] = {}
         pretrain_train_entries: list[dict[str, Any]] = []
         pretrain_val_entries: list[dict[str, Any]] = []
+        pretrain_test_entries: list[dict[str, Any]] = []
         pretrain_split_summary: dict[str, Any] | None = None
+        pretraining_test_metrics: dict[str, dict[str, float]] = {}
+        pretrain_label_map = load_pretrain_folder_label_map(Path(args.pretrain_label_map)) if args.pretrain_root and args.pretrain_label_map else {}
 
         if args.pretrain_root:
             pretrain_root = Path(args.pretrain_root)
-            pretrain_class_to_index, pretrain_train_entries, pretrain_val_entries, pretrain_split_summary = collect_pretrain_entries_with_redefined_split(
+            pretrain_class_to_index, pretrain_train_entries, pretrain_val_entries, pretrain_test_entries, pretrain_split_summary = collect_pretrain_entries_with_redefined_split(
                 pretrain_root,
                 codebook,
                 seed=args.seed,
@@ -1009,19 +1292,25 @@ def main() -> None:
                 max_classes=args.pretrain_max_classes,
                 max_samples_per_class=args.pretrain_max_samples_per_class,
                 manifest_path=pretrain_manifest_path,
+                test_manifest_path=pretrain_test_manifest_path,
+                folder_label_map=pretrain_label_map,
             )
-            if pretrain_train_entries or pretrain_val_entries:
+            if pretrain_train_entries or pretrain_val_entries or pretrain_test_entries:
                 write_manifest(pretrain_train_entries, Path(args.pretrain_split_manifest_train))
-                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "seen_test"], Path(args.pretrain_split_manifest_seen_test))
-                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "unseen_test"], Path(args.pretrain_split_manifest_unseen_test))
+                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "val_seen"], Path(args.pretrain_split_manifest_val_seen))
+                write_manifest([entry for entry in pretrain_val_entries if entry.get("split") == "val_unseen"], Path(args.pretrain_split_manifest_val_unseen))
+                write_manifest([entry for entry in pretrain_test_entries if entry.get("split") == "test_seen"], Path(args.pretrain_split_manifest_seen_test))
+                write_manifest([entry for entry in pretrain_test_entries if entry.get("split") == "test_unseen"], Path(args.pretrain_split_manifest_unseen_test))
 
                 print(f"Using {len(pretrain_class_to_index)} classes from pretraining dataset {pretrain_root}")
                 print(
-                    "Pretrain redefined split summary: "
-                    f"total_images={pretrain_split_summary['total_images']} resolved={pretrain_split_summary['resolved_images']} unresolved={pretrain_split_summary['unresolved_images']} | "
+                    "CASIA official Train/validation/test split: "
+                    f"official_train={pretrain_split_summary['official_train']} official_test={pretrain_split_summary['official_test']} | "
                     f"train_classes={pretrain_split_summary['train_classes']} train_samples={pretrain_split_summary['train_samples']} | "
-                    f"seen_test_classes={pretrain_split_summary['seen_test_classes']} seen_test_samples={pretrain_split_summary['seen_test_samples']} | "
-                    f"unseen_classes={pretrain_split_summary['unseen_classes']} unseen_test_samples={pretrain_split_summary['unseen_test_samples']}"
+                    f"val_seen={pretrain_split_summary['val_seen_classes']} classes/{pretrain_split_summary['val_seen_samples']} samples "
+                    f"val_unseen={pretrain_split_summary['val_unseen_classes']} classes/{pretrain_split_summary['val_unseen_samples']} samples | "
+                    f"test_seen={pretrain_split_summary['test_seen_classes']} classes/{pretrain_split_summary['test_seen_samples']} samples "
+                    f"test_unseen={pretrain_split_summary['test_unseen_classes']} classes/{pretrain_split_summary['test_unseen_samples']} samples"
                 )
 
                 pretrain_codebook_vectors = [torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(pretrain_class_to_index.keys())]
@@ -1043,6 +1332,28 @@ def main() -> None:
                     verbose=True,
                 )
                 print(f"Pretraining complete. Best validation accuracy on pretraining data: {best_pre_acc:.4f} at epoch {best_pre_epoch}.")
+                pretrain_test_seen = [entry for entry in pretrain_test_entries if entry.get("split") == "test_seen"]
+                pretrain_test_unseen = [entry for entry in pretrain_test_entries if entry.get("split") == "test_unseen"]
+                if pretrain_test_seen:
+                    test_loss, test_accuracy = evaluate_entries(
+                        pretrain_model, pretrain_test_seen, pretrain_codebook_matrix, device, args.batch_size,
+                        bool(getattr(codebook, "structured", False)),
+                    )
+                    print(
+                        f"CASIA official Test seen: classes={count_unique_classes(pretrain_test_seen)} "
+                        f"samples={len(pretrain_test_seen)} loss={test_loss:.4f} accuracy={test_accuracy:.4f}"
+                    )
+                    pretraining_test_metrics["seen"] = {"loss": test_loss, "accuracy": test_accuracy}
+                if pretrain_test_unseen:
+                    test_loss, test_accuracy = evaluate_entries(
+                        pretrain_model, pretrain_test_unseen, pretrain_codebook_matrix, device, args.batch_size,
+                        bool(getattr(codebook, "structured", False)),
+                    )
+                    print(
+                        f"CASIA official Test unseen: classes={count_unique_classes(pretrain_test_unseen)} "
+                        f"samples={len(pretrain_test_unseen)} loss={test_loss:.4f} accuracy={test_accuracy:.4f}"
+                    )
+                    pretraining_test_metrics["unseen"] = {"loss": test_loss, "accuracy": test_accuracy}
             else:
                 print(f"No pretraining samples found under {pretrain_root}. Continuing without pretraining.")
 
@@ -1057,18 +1368,26 @@ def main() -> None:
         if len(class_to_index) == 0:
             raise ValueError("No valid CodeBook classes were found in the dataset.")
 
-        labels = [entry["label"] for entry in entries]
-        train_indices, val_indices = build_split(labels, args.train_ratio, args.seed)
-        if not train_indices or not val_indices:
-            raise ValueError("Training or validation split is empty; use a larger dataset or lower train_ratio.")
-
-        train_entries = [entries[idx] for idx in train_indices]
-        val_entries = [entries[idx] for idx in val_indices]
+        train_entries, val_entries, test_entries, finetune_split_summary = build_seen_unseen_sample_split(
+            entries,
+            train_class_ratio=args.finetune_train_class_ratio,
+            train_sample_ratio=args.train_ratio,
+            validation_sample_ratio=args.validation_sample_ratio,
+            seed=args.seed,
+        )
+        if not train_entries or not val_entries:
+            raise ValueError("Fine-tuning train or validation split is empty; use a larger dataset or adjust split ratios.")
+        write_manifest(train_entries, Path(args.finetune_split_manifest_train))
+        write_manifest(val_entries, Path(args.finetune_split_manifest_val))
+        write_manifest(test_entries, Path(args.finetune_split_manifest_test))
         print(
             "Fine-tuning split summary: "
-            f"classes={len(class_to_index)} samples={len(entries)} | "
-            f"train_classes={count_unique_classes(train_entries)} train_samples={len(train_entries)} | "
-            f"val_classes={count_unique_classes(val_entries)} val_samples={len(val_entries)}"
+            f"classes={finetune_split_summary['classes']} samples={len(entries)} | "
+            f"train_classes={finetune_split_summary['train_classes']} train_samples={finetune_split_summary['train_samples']} | "
+            f"val_seen={finetune_split_summary['val_seen_classes']} classes/{finetune_split_summary['val_seen_samples']} samples "
+            f"val_unseen={finetune_split_summary['val_unseen_classes']} classes/{finetune_split_summary['val_unseen_samples']} samples | "
+            f"test_seen={finetune_split_summary['test_seen_classes']} classes/{finetune_split_summary['test_seen_samples']} samples "
+            f"test_unseen={finetune_split_summary['test_unseen_classes']} classes/{finetune_split_summary['test_unseen_samples']} samples"
         )
 
         codebook_matrix = torch.stack([torch.tensor(codebook[unicode_key], dtype=torch.float32) for unicode_key in sorted(class_to_index.keys())])
@@ -1094,6 +1413,30 @@ def main() -> None:
             verbose=True,
         )
 
+        fine_tune_test_seen = [entry for entry in test_entries if entry.get("split") == "test_seen"]
+        fine_tune_test_unseen = [entry for entry in test_entries if entry.get("split") == "test_unseen"]
+        fine_tuning_test_metrics: dict[str, dict[str, float]] = {}
+        if fine_tune_test_seen:
+            test_loss, test_accuracy = evaluate_entries(
+                model, fine_tune_test_seen, codebook_matrix, device, args.batch_size,
+                bool(getattr(codebook, "structured", False)),
+            )
+            print(
+                f"Fine-tuning test seen: classes={count_unique_classes(fine_tune_test_seen)} "
+                f"samples={len(fine_tune_test_seen)} loss={test_loss:.4f} accuracy={test_accuracy:.4f}"
+            )
+            fine_tuning_test_metrics["seen"] = {"loss": test_loss, "accuracy": test_accuracy}
+        if fine_tune_test_unseen:
+            test_loss, test_accuracy = evaluate_entries(
+                model, fine_tune_test_unseen, codebook_matrix, device, args.batch_size,
+                bool(getattr(codebook, "structured", False)),
+            )
+            print(
+                f"Fine-tuning test unseen: classes={count_unique_classes(fine_tune_test_unseen)} "
+                f"samples={len(fine_tune_test_unseen)} loss={test_loss:.4f} accuracy={test_accuracy:.4f}"
+            )
+            fine_tuning_test_metrics["unseen"] = {"loss": test_loss, "accuracy": test_accuracy}
+
         metadata = {
             "output_dir": str(output_dir),
             "data_root": str(args.data_root),
@@ -1106,6 +1449,9 @@ def main() -> None:
             "seed": args.seed,
             "device": args.device,
             "structured_codebook": bool(getattr(codebook, "structured", False)),
+            "pretrain_label_map": str(args.pretrain_label_map) if args.pretrain_root else None,
+            "pretrain_train_manifest": str(pretrain_manifest_path) if pretrain_manifest_path else None,
+            "pretrain_official_test_manifest": str(pretrain_test_manifest_path) if pretrain_test_manifest_path else None,
             "checkpoint_path": str(checkpoint_path),
             "state_path": str(state_path),
             "pretrain_checkpoint_path": str(pretrain_checkpoint_path),
@@ -1113,14 +1459,23 @@ def main() -> None:
             "pretrain_split_summary": {
                 "classes": len(pretrain_class_to_index) if args.pretrain_root else 0,
                 "train": summarize_entries(pretrain_train_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
-                "val": summarize_entries(pretrain_val_entries) if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else {"classes": 0, "samples": 0},
-                "redefined": pretrain_split_summary if args.pretrain_root and (pretrain_train_entries or pretrain_val_entries) else None,
+                "validation_seen": summarize_entries([entry for entry in pretrain_val_entries if entry.get("split") == "val_seen"]) if args.pretrain_root else {"classes": 0, "samples": 0},
+                "validation_unseen": summarize_entries([entry for entry in pretrain_val_entries if entry.get("split") == "val_unseen"]) if args.pretrain_root else {"classes": 0, "samples": 0},
+                "test_seen": summarize_entries([entry for entry in pretrain_test_entries if entry.get("split") == "test_seen"]) if args.pretrain_root else {"classes": 0, "samples": 0},
+                "test_unseen": summarize_entries([entry for entry in pretrain_test_entries if entry.get("split") == "test_unseen"]) if args.pretrain_root else {"classes": 0, "samples": 0},
+                "split_details": pretrain_split_summary if args.pretrain_root else None,
             } if args.pretrain_root else None,
+            "pretraining_test_metrics": pretraining_test_metrics,
             "fine_tuning_split_summary": {
                 "classes": len(class_to_index),
                 "train": summarize_entries(train_entries),
-                "val": summarize_entries(val_entries),
+                "validation_seen": summarize_entries([entry for entry in val_entries if entry.get("split") == "val_seen"]),
+                "validation_unseen": summarize_entries([entry for entry in val_entries if entry.get("split") == "val_unseen"]),
+                "test_seen": summarize_entries(fine_tune_test_seen),
+                "test_unseen": summarize_entries(fine_tune_test_unseen),
+                "split_details": finetune_split_summary,
             },
+            "fine_tuning_test_metrics": fine_tuning_test_metrics,
             "best_accuracy": best_accuracy,
             "best_epoch": best_epoch,
         }
