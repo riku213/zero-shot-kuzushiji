@@ -548,3 +548,14 @@ python src/6_train_model.py ^
   --build-manifest ^
   --log-path "outputs/261010_tuned_codebook/training/train.log"
 ```
+
+cos類似度でumap64次元に圧縮．codebook再作成
+'''
+python src/4_generate_fare.py ^
+  --features "outputs/261010_tuned_codebook/all_glyph_features.pkl" ^
+  --manifest "outputs/261007_correct_dict/combined_render_manifest.pkl" ^
+  --output "outputs/261018_cos_codebook/all_glyph_codes.pkl" ^
+  --n-components 64 ^
+  --random-state 42 ^
+  --metric cosine
+'''

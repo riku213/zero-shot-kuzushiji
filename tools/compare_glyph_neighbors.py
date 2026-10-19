@@ -11,9 +11,9 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "outputs/261010_tuned_codebook/all_glyph_codes.pkl"
+DEFAULT_INPUT = ROOT / "outputs/261018_cos_codebook/all_glyph_codes.pkl"
 DEFAULT_INVENTORY = ROOT / "outputs/radical_inventory.pkl"
-DEFAULT_OUTPUT = ROOT / "outputs/261010_tuned_codebook/glyph_neighbors.html"
+DEFAULT_OUTPUT = ROOT / "outputs/261018_cos_codebook/glyph_neighbors.html"
 DEFAULT_FONT = ROOT / "dataset/fonts/HanaMinA.ttf"
 
 
