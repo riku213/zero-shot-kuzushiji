@@ -28,6 +28,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-components", type=int, default=64, help="UMAP target dimension.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for deterministic output.")
+    parser.add_argument("--metric", default="euclidean", help="UMAP distance metric, e.g. euclidean or cosine.")
+    parser.add_argument(
+        "--threshold",
+        choices=("median", "mean", "zero"),
+        default="median",
+        help="Per-dimension binarization threshold; 'zero' reproduces the old tanh sign rule.",
+    )
     parser.add_argument(
         "--random-alien-codes",
         action="store_true",
@@ -80,18 +87,23 @@ def main() -> None:
     reducer = UMAP(
         n_components=args.n_components,
         n_neighbors=n_neighbors,
-        metric="euclidean",
+        metric=args.metric,
         random_state=args.random_state,
         transform_seed=args.random_state,
         init="random",
     )
     projected = reducer.fit_transform(feature_matrix)
+    thresholds = {
+        "median": np.median(projected, axis=0),
+        "mean": projected.mean(axis=0),
+        "zero": np.zeros(projected.shape[1], dtype=projected.dtype),
+    }[args.threshold]
 
     existing_codes: set[tuple[int, ...]] = set()
     payload_records: list[FareCodeRecord] = []
 
     for record, vector in zip(renderable_records, projected, strict=False):
-        fare_code = [1 if value > 0 else -1 for value in np.tanh(vector).tolist()]
+        fare_code = [1 if value > 0 else -1 for value in (vector - thresholds).tolist()]
         code_key = tuple(fare_code)
         if code_key in existing_codes:
             fare_code = build_unique_binary_code(existing_codes, rng, length=args.n_components)
