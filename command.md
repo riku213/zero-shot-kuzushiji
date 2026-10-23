@@ -559,3 +559,40 @@ python src/4_generate_fare.py ^
   --random-state 42 ^
   --metric cosine
 '''
+
+[26/10/19] ViTによる学習．codebookはumap-cosによる2値化部首を使っている．2値化の閾値にはデータの中央値を使っている．
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261019_ViT_umap_cos/final_codebook_1212.pkl" ^
+  --output-dir "outputs/261019_ViT_umap_cos/training" ^
+  --checkpoint-path "outputs/261019_ViT_umap_cos/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261019_ViT_umap_cos/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261019_ViT_umap_cos/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261019_ViT_umap_cos/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261019_ViT_umap_cos/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261019_ViT_umap_cos/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261019_ViT_umap_cos/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261019_ViT_umap_cos/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261019_ViT_umap_cos/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261019_ViT_umap_cos/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261019_ViT_umap_cos/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261019_ViT_umap_cos/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261019_ViT_umap_cos/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --num-workers 4 ^
+  --log-path "outputs/261019_ViT_umap_cos/training/train.log"
+```
