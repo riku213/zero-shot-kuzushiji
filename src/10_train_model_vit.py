@@ -33,6 +33,9 @@ SETTINGS = argparse.Namespace(
     aux_weight=0.5,
     augmentation=True,
     num_workers=4,
+    logit_bound=5.0,
+    warmup_steps=3000,
+    lr_patience=5,
 )
 
 
@@ -147,14 +150,22 @@ class ViTFareRecognitionModel(nn.Module):
         self.backbone = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
         self.backbone.heads = nn.Identity()
         self.projection = nn.Linear(768, codebook_dim)
+        self.logit_bound = float(SETTINGS.logit_bound)
 
-    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
             x = F.interpolate(x, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False)
         with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=x.is_cuda):
             features = self.backbone(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             return self.projection(features.float())
+
+    def bound(self, raw: torch.Tensor) -> torch.Tensor:
+        # Sign is unchanged; the gradient shrinks as |raw| grows, which stops logit growth through the STE.
+        return self.logit_bound * torch.tanh(raw / self.logit_bound)
+
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bound(self.forward_raw(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return base.STEBinarize.apply(self.forward_logits(x))
@@ -202,15 +213,17 @@ def train_vit_on_dataset(
     head_params = [p for name, p in model.named_parameters() if not name.startswith("backbone.")]
     optimizer = torch.optim.AdamW(
         [
-            {"params": backbone_params, "lr": SETTINGS.lr},
-            {"params": head_params, "lr": SETTINGS.head_lr},
+            {"params": backbone_params, "lr": SETTINGS.lr, "target_lr": SETTINGS.lr},
+            {"params": head_params, "lr": SETTINGS.head_lr, "target_lr": SETTINGS.head_lr},
         ],
         weight_decay=SETTINGS.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, threshold=SETTINGS.min_delta,
+        optimizer, mode="min", factor=0.5, patience=SETTINGS.lr_patience, threshold=SETTINGS.min_delta,
         threshold_mode="abs", cooldown=1, min_lr=[1e-6, 1e-5],
     )
+    steps_per_epoch = max(1, len(train_loader))
+    warmup_steps = min(SETTINGS.warmup_steps, steps_per_epoch)
     criterion = nn.CrossEntropyLoss()
     best_seen_loss = float("inf")
     best_accuracy = -1.0
@@ -236,6 +249,8 @@ def train_vit_on_dataset(
             start_epoch = int(state.get("epoch", 0)) + 1
             if verbose:
                 print(f"Resumed training from {state_path} at epoch {start_epoch}")
+    for group, target in zip(optimizer.param_groups, (SETTINGS.lr, SETTINGS.head_lr)):
+        group.setdefault("target_lr", target)
 
     if start_epoch > epochs:
         if checkpoint_path.exists():
@@ -247,44 +262,64 @@ def train_vit_on_dataset(
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
-        running_loss = 0.0
+        totals = {"total": 0.0, "cls": 0.0, "aux": 0.0, "abs_logit": 0.0, "bit_error": 0.0}
         seen = 0
-        for batch in tqdm(train_loader, desc=f"Train E{epoch}", leave=False):
+        for batch_index, batch in enumerate(tqdm(train_loader, desc=f"Train E{epoch}", leave=False)):
             if batch is None:
                 continue
+            global_step = (epoch - 1) * steps_per_epoch + batch_index
+            if global_step < warmup_steps:
+                warmup_factor = (global_step + 1) / warmup_steps
+                for group in optimizer.param_groups:
+                    group["lr"] = group["target_lr"] * warmup_factor
+
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            raw_logits = model.forward_logits(images)
-            encoded = base.STEBinarize.apply(raw_logits)
+            raw_logits = model.forward_raw(images)
+            bounded_logits = model.bound(raw_logits)
+            encoded = base.STEBinarize.apply(bounded_logits)
             class_scores = base.codebook_logits(encoded, codebook_matrix, structured_codebook)
             classification_loss = criterion(class_scores, labels)
+            targets = codebook_matrix.index_select(0, labels)
+            valid_bits = targets.ne(0)
             if SETTINGS.aux_loss:
-                targets = codebook_matrix.index_select(0, labels)
-                valid_bits = targets.ne(0)
-                binary_targets = targets.gt(0).to(raw_logits.dtype)
-                bit_loss = F.binary_cross_entropy_with_logits(raw_logits, binary_targets, reduction="none")
+                binary_targets = targets.gt(0).to(bounded_logits.dtype)
+                bit_loss = F.binary_cross_entropy_with_logits(bounded_logits, binary_targets, reduction="none")
                 per_sample_aux = (bit_loss * valid_bits).sum(dim=1) / valid_bits.sum(dim=1).clamp_min(1)
                 auxiliary_loss = per_sample_aux.mean()
                 loss = classification_loss + SETTINGS.aux_weight * auxiliary_loss
             else:
-                auxiliary_loss = raw_logits.new_zeros(())
+                auxiliary_loss = bounded_logits.new_zeros(())
                 loss = classification_loss
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            running_loss += loss.item() * images.size(0)
-            seen += images.size(0)
 
-        train_loss = running_loss / max(1, seen)
+            with torch.no_grad():
+                wrong_bits = ((raw_logits > 0) != targets.gt(0)) & valid_bits
+                bit_error = (wrong_bits.sum(dim=1) / valid_bits.sum(dim=1).clamp_min(1)).mean()
+            batch_size_now = images.size(0)
+            totals["total"] += loss.item() * batch_size_now
+            totals["cls"] += classification_loss.item() * batch_size_now
+            totals["aux"] += auxiliary_loss.item() * batch_size_now
+            totals["abs_logit"] += raw_logits.detach().abs().mean().item() * batch_size_now
+            totals["bit_error"] += bit_error.item() * batch_size_now
+            seen += batch_size_now
+
+        averages = {key: value / max(1, seen) for key, value in totals.items()}
+        train_loss = averages["total"]
         val_loss, val_accuracy = base.evaluate(model, val_loader, codebook_matrix, device, structured_codebook)
         scheduler.step(val_loss)
         learning_rates = ",".join(f"{group['lr']:.2e}" for group in optimizer.param_groups)
         if verbose:
             aug_label = "on" if SETTINGS.augmentation else "off"
             aux_label = "on" if SETTINGS.aux_loss else "off"
+            aux_text = f"train_aux_loss={averages['aux']:.4f} | " if SETTINGS.aux_loss else ""
             print(
                 f"Epoch {epoch:03d}/{epochs:03d} | train_loss={train_loss:.4f} | "
+                f"train_cls_loss={averages['cls']:.4f} | {aux_text}"
+                f"mean_abs_raw_logit={averages['abs_logit']:.1f} | bit_error={averages['bit_error']:.3f} | "
                 f"val_seen_loss={val_loss:.4f} | val_seen_acc={val_accuracy:.4f} | "
                 f"lr={learning_rates} | aug={aug_label} | aux={aux_label}"
             )
@@ -350,6 +385,9 @@ def main() -> None:
     parser.add_argument("--vit-aux-weight", type=float, default=SETTINGS.aux_weight)
     parser.add_argument("--vit-augmentation", action=argparse.BooleanOptionalAction, default=SETTINGS.augmentation)
     parser.add_argument("--num-workers", type=int, default=SETTINGS.num_workers)
+    parser.add_argument("--vit-logit-bound", type=float, default=SETTINGS.logit_bound)
+    parser.add_argument("--vit-warmup-steps", type=int, default=SETTINGS.warmup_steps)
+    parser.add_argument("--lr-scheduler-patience", type=int, default=SETTINGS.lr_patience)
     options, remaining = parser.parse_known_args()
     SETTINGS.lr = options.vit_lr
     SETTINGS.head_lr = options.vit_head_lr
@@ -360,6 +398,9 @@ def main() -> None:
     SETTINGS.aux_weight = options.vit_aux_weight
     SETTINGS.augmentation = options.vit_augmentation
     SETTINGS.num_workers = options.num_workers
+    SETTINGS.logit_bound = options.vit_logit_bound
+    SETTINGS.warmup_steps = options.vit_warmup_steps
+    SETTINGS.lr_patience = options.lr_scheduler_patience
     sys.argv = [sys.argv[0], *remaining]
 
     original_parse_args = base.parse_args
@@ -391,6 +432,9 @@ def main() -> None:
             "early_stopping_patience": SETTINGS.patience,
             "early_stopping_min_delta": SETTINGS.min_delta,
             "scheduler": "ReduceLROnPlateau",
+            "scheduler_patience": SETTINGS.lr_patience,
+            "logit_bound": SETTINGS.logit_bound,
+            "warmup_steps": SETTINGS.warmup_steps,
         }
         original_save_json(path, metadata)
 

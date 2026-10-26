@@ -596,3 +596,43 @@ python src/10_train_model_vit.py ^
   --num-workers 4 ^
   --log-path "outputs/261019_ViT_umap_cos/training/train.log"
 ```
+
+[26/10/25]ViTを400次元のコード出力で学習，未知データひらがなカタカナを削除．補助損失を追加，学習データに対するオーグメンテーション，Early Stopping 
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --output-dir "outputs/261024_ViT_code400/training" ^
+  --checkpoint-path "outputs/261024_ViT_code400/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261024_ViT_code400/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261024_ViT_code400/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261024_ViT_code400/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261024_ViT_code400/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261024_ViT_code400/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261024_ViT_code400/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261024_ViT_code400/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261024_ViT_code400/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261024_ViT_code400/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261024_ViT_code400/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261024_ViT_code400/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261024_ViT_code400/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --early-stopping-patience 10 ^
+  --early-stopping-min-delta 0.01 ^
+  --vit-aux-loss ^
+  --vit-aux-weight 0.5 ^
+  --vit-augmentation ^
+  --log-path "outputs/261024_ViT_code400/training/train.log"
+```
