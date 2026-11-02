@@ -695,3 +695,27 @@ python src/10_train_model_vit.py ^
   --num-workers 4 ^
   --log-path "outputs/261102_stage1_ft/training/train.log"
 ```
+
+[26/11/2] 出力ヘッドを木構造のノード数分用意，各パーツの他クラス分類タスクとして学習．
+```
+conda activate kuzushiji
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --init-from "outputs/261027_ViT_code400_v2/training/pretrain_best_fare_model.pth" ^
+  --output-dir "outputs/261102_stage2_ft/training" ^
+  --checkpoint-path "outputs/261102_stage2_ft/training/best_fare_model.pth" ^
+  --state-path "outputs/261102_stage2_ft/training/training_state.pth" ^
+  --metadata-path "outputs/261102_stage2_ft/training/run_metadata.json" ^
+  --finetune-split-manifest-train "outputs/261102_stage2_ft/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261102_stage2_ft/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261102_stage2_ft/training/finetune_test_manifest.txt" ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --log-path "outputs/261102_stage2_ft/training/train.log"
+```
