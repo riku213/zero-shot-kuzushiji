@@ -636,3 +636,39 @@ python src/10_train_model_vit.py ^
   --vit-augmentation ^
   --log-path "outputs/261024_ViT_code400/training/train.log"
 ```
+
+
+[26/10/27] 補助損失が過剰に爆発．tanhとclamp?で抑制．
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --output-dir "outputs/261027_ViT_code400_v2/training" ^
+  --checkpoint-path "outputs/261027_ViT_code400_v2/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261027_ViT_code400_v2/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261027_ViT_code400_v2/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261027_ViT_code400_v2/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261027_ViT_code400_v2/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261027_ViT_code400_v2/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261027_ViT_code400_v2/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261027_ViT_code400_v2/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261027_ViT_code400_v2/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261027_ViT_code400_v2/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261027_ViT_code400_v2/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261027_ViT_code400_v2/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261027_ViT_code400_v2/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --log-path "outputs/261027_ViT_code400_v2/training/train.log"
+```

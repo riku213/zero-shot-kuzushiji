@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import importlib.util
-import math
+import json
 import random
 import sys
 import unicodedata
@@ -28,7 +29,7 @@ SETTINGS = argparse.Namespace(
     head_lr=1e-3,
     weight_decay=0.05,
     patience=10,
-    min_delta=0.01,
+    min_delta=None,
     aux_loss=True,
     aux_weight=0.5,
     augmentation=True,
@@ -36,7 +37,20 @@ SETTINGS = argparse.Namespace(
     logit_bound=5.0,
     warmup_steps=3000,
     lr_patience=5,
+    monitor="val_h",
+    ce_train_classes_only=True,
+    kana_cap=300,
+    val_max_samples=20000,
+    init_from=None,
+    disjoint_unseen=True,
 )
+
+# Penalties subtracted from seen-class scores (calibrated stacking); candidates for the validation grid search.
+GAMMA_GRID = (0.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0)
+# (mode, default min_delta) per monitored validation metric.
+MONITORS = {"val_h": ("max", 0.002), "val_unseen_zsl_acc": ("max", 0.002), "val_seen_loss": ("min", 0.01)}
+# Shared between the training function and the patched test evaluation.
+STATE: dict[str, Any] = {"seen_mask": None, "gamma": 0.0, "stage": "", "out_dir": None}
 
 
 def is_kana_label(label: str) -> bool:
@@ -89,6 +103,42 @@ def build_split_with_kana_seen(
         print(
             f"Moved low-sample kana classes into training to keep them out of unseen splits: "
             f"{len(moved_kana_classes)} classes, {sum(is_kana_label(str(entry['unicode'])) for entry in train_entries)} train samples."
+        )
+
+    # Unseen classes are split by class (not by sample) so validation never reuses test-unseen classes.
+    unseen_entries = [entry for entry in val_entries + test_entries if entry.get("split") in {"val_unseen", "test_unseen"}]
+    if SETTINGS.disjoint_unseen and unseen_entries:
+        ordered = sorted(
+            {str(entry["unicode"]) for entry in unseen_entries},
+            key=lambda name: original_stable_value(seed, "finetune-unseen-class-group", name),
+        )
+        validation_count = len(ordered) if len(ordered) == 1 else min(max(1, round(len(ordered) * validation_sample_ratio)), len(ordered) - 1)
+        validation_classes = set(ordered[:validation_count])
+        regrouped_val, regrouped_test = [], []
+        for entry in unseen_entries:
+            item = dict(entry)
+            item["split"] = "val_unseen" if str(entry["unicode"]) in validation_classes else "test_unseen"
+            (regrouped_val if item["split"] == "val_unseen" else regrouped_test).append(item)
+        val_entries[:] = [entry for entry in val_entries if entry.get("split") == "val_seen"] + regrouped_val
+        test_entries[:] = [entry for entry in test_entries if entry.get("split") == "test_seen"] + regrouped_test
+
+    if SETTINGS.kana_cap > 0:
+        kana_by_class: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+        kept_entries = []
+        for entry in train_entries:
+            if is_kana_label(str(entry["unicode"])):
+                kana_by_class[str(entry["unicode"])].append(entry)
+            else:
+                kept_entries.append(entry)
+        before = sum(len(items) for items in kana_by_class.values())
+        for name, items in kana_by_class.items():
+            items.sort(key=lambda entry: original_stable_value(seed, "kana-cap", name, str(entry["image_path"])))
+            kept_entries.extend(items[: SETTINGS.kana_cap])
+        train_entries = kept_entries
+        after = sum(is_kana_label(str(entry["unicode"])) for entry in train_entries)
+        print(
+            f"Kana training samples capped at {SETTINGS.kana_cap}/class: {before} -> {after} "
+            f"({after / max(1, len(train_entries)):.1%} of {len(train_entries)} training samples)."
         )
 
     def class_count(group: list[dict[str, Any]], split: str) -> int:
@@ -171,6 +221,146 @@ class ViTFareRecognitionModel(nn.Module):
         return base.STEBinarize.apply(self.forward_logits(x))
 
 
+def make_model(codebook_dim: int = 400, **_: Any) -> nn.Module:
+    model = ViTFareRecognitionModel(codebook_dim=codebook_dim)
+    if SETTINGS.init_from:
+        checkpoint = torch.load(SETTINGS.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        print(f"Initialized model from {SETTINGS.init_from} (epoch {checkpoint.get('epoch')}).")
+    return model
+
+
+@torch.no_grad()
+def evaluate_group(
+    model: nn.Module,
+    loader: DataLoader | None,
+    matrix: torch.Tensor,
+    structured: bool,
+    device: torch.device,
+    seen_mask: torch.Tensor,
+    unseen_group: bool,
+    gamma: float | None = None,
+) -> dict[str, Any]:
+    """One pass over a group of samples: all-class (GZSL), closed-set, and calibrated-stacking accuracy."""
+    model.eval()
+    totals: collections.Counter = collections.Counter()
+    gamma_correct: collections.Counter = collections.Counter()
+    pool = ~seen_mask if unseen_group else seen_mask
+    seen_float = seen_mask.float().unsqueeze(0)
+    grid = GAMMA_GRID if gamma is None else tuple(sorted({0.0, float(gamma)}))
+    if loader is not None:
+        for batch in loader:
+            if batch is None:
+                continue
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            scores = base.codebook_logits(model(images), matrix, structured)
+            predictions = scores.argmax(1)
+            correct = predictions == labels
+            closed_scores = scores.masked_fill(~pool.unsqueeze(0), float("-inf"))
+            closed_ce = closed_scores.logsumexp(1) - scores.gather(1, labels.unsqueeze(1)).squeeze(1)
+            kana = torch.tensor([is_kana_label(str(name)) for name in batch["unicode"]], device=device)
+            totals["n"] += labels.size(0)
+            totals["ce_all"] += F.cross_entropy(scores, labels, reduction="sum").item()
+            totals["ce_closed"] += closed_ce.clamp(max=100.0).sum().item()
+            totals["correct"] += correct.sum().item()
+            totals["closed_correct"] += (closed_scores.argmax(1) == labels).sum().item()
+            totals["into_seen"] += seen_mask[predictions].sum().item()
+            totals["kana_n"] += kana.sum().item()
+            totals["kana_correct"] += (correct & kana).sum().item()
+            for value in grid:
+                adjusted = scores - value * seen_float
+                gamma_correct[value] += (adjusted.argmax(1) == labels).sum().item()
+    n = totals["n"]
+    kanji_n = n - totals["kana_n"]
+    return {
+        "n": n,
+        "loss_all": totals["ce_all"] / max(1, n),
+        "acc": totals["correct"] / max(1, n),
+        "closed_loss": totals["ce_closed"] / max(1, n),
+        "closed_acc": totals["closed_correct"] / max(1, n),
+        "into_seen": totals["into_seen"] / max(1, n),
+        "kana_acc": totals["kana_correct"] / totals["kana_n"] if totals["kana_n"] else None,
+        "kanji_acc": (totals["correct"] - totals["kana_correct"]) / kanji_n if kanji_n else None,
+        "gamma_acc": {value: gamma_correct[value] / max(1, n) for value in grid},
+    }
+
+
+def harmonic_mean(first: float, second: float) -> float:
+    return 2 * first * second / (first + second) if first + second > 0 else 0.0
+
+
+def summarize_validation(seen: dict[str, Any], unseen: dict[str, Any]) -> dict[str, float]:
+    best_h, best_gamma = -1.0, 0.0
+    for value in GAMMA_GRID:
+        h = harmonic_mean(seen["gamma_acc"][value], unseen["gamma_acc"][value])
+        if h > best_h:
+            best_h, best_gamma = h, value
+    return {
+        "val_seen_loss": seen["loss_all"],
+        "val_seen_acc": seen["acc"],
+        "val_seen_kanji_acc": seen["kanji_acc"] if seen["kanji_acc"] is not None else float("nan"),
+        "val_unseen_loss": unseen["loss_all"],
+        "val_unseen_zsl_loss": unseen["closed_loss"],
+        "val_unseen_zsl_acc": unseen["closed_acc"],
+        "val_unseen_gzsl_acc": unseen["acc"],
+        "val_unseen_into_seen": unseen["into_seen"],
+        "cs_gamma": best_gamma,
+        "cs_seen_acc": seen["gamma_acc"][best_gamma],
+        "cs_unseen_acc": unseen["gamma_acc"][best_gamma],
+        "val_h": max(best_h, 0.0),
+    }
+
+
+def evaluate_entries_extended(
+    model: nn.Module,
+    entries: list[dict[str, Any]],
+    codebook: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    structured_codebook: bool,
+) -> tuple[float, float]:
+    """Replaces the base test evaluation: same (loss, accuracy) return, plus ZSL/calibrated metrics."""
+    seen_mask = STATE["seen_mask"]
+    split = str(entries[0].get("split", "")) if entries else ""
+    unseen_group = split.endswith("unseen")
+    loader = DataLoader(
+        ViTCharacterDataset(entries),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=SETTINGS.num_workers,
+        pin_memory=device.type == "cuda",
+        collate_fn=base.safe_collate,
+    )
+    stats = evaluate_group(model, loader, codebook, structured_codebook, device, seen_mask, unseen_group, STATE["gamma"])
+    gamma = STATE["gamma"]
+    stage = STATE["stage"]
+    kanji = "n/a" if stats["kanji_acc"] is None else f"{stats['kanji_acc']:.4f}"
+    kana = "n/a" if stats["kana_acc"] is None else f"{stats['kana_acc']:.4f}"
+    print(
+        f"[extended {stage}/{split}] n={stats['n']} gzsl_acc={stats['acc']:.4f} "
+        f"{'zsl_acc' if unseen_group else 'seen_closed_acc'}={stats['closed_acc']:.4f} "
+        f"calibrated(gamma={gamma:g})_acc={stats['gamma_acc'][gamma]:.4f} "
+        f"predicted_into_seen={stats['into_seen']:.3f} kanji_acc={kanji} kana_acc={kana}"
+    )
+    if STATE["out_dir"] is not None:
+        path = Path(STATE["out_dir"]) / "extended_test_metrics.json"
+        results = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        results[f"{stage}/{split}"] = {**stats, "gamma": gamma, "gamma_acc": {str(k): v for k, v in stats["gamma_acc"].items()}}
+        path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    return stats["loss_all"], stats["acc"]
+
+
+def subsample_entries(entries: list[dict[str, Any]], limit: int, seed: int) -> list[dict[str, Any]]:
+    if limit <= 0 or len(entries) <= limit:
+        return entries
+    return random.Random(seed).sample(entries, limit)
+
+
+def is_improvement(value: float, best: float, mode: str, delta: float) -> bool:
+    return value > best + delta if mode == "max" else value < best - delta
+
+
 def train_vit_on_dataset(
     model: nn.Module,
     train_entries: list[dict[str, Any]],
@@ -200,14 +390,37 @@ def train_vit_on_dataset(
         **loader_options,
     )
     seen_validation = [entry for entry in val_entries if entry.get("split") in {"val_seen", ""}]
-    if not seen_validation:
+    unseen_validation = [entry for entry in val_entries if entry.get("split") == "val_unseen"]
+    if not seen_validation and not unseen_validation:
         seen_validation = val_entries
-    val_loader = DataLoader(
-        ViTCharacterDataset(seen_validation),
-        batch_size=batch_size,
-        shuffle=False,
-        **loader_options,
+    seen_validation = subsample_entries(seen_validation, SETTINGS.val_max_samples, seed)
+    unseen_validation = subsample_entries(unseen_validation, SETTINGS.val_max_samples, seed)
+    val_seen_loader = DataLoader(ViTCharacterDataset(seen_validation), batch_size=batch_size, shuffle=False, **loader_options)
+    val_unseen_loader = (
+        DataLoader(ViTCharacterDataset(unseen_validation), batch_size=batch_size, shuffle=False, **loader_options)
+        if unseen_validation
+        else None
     )
+
+    num_classes = codebook_matrix.shape[0]
+    train_mask = torch.zeros(num_classes, dtype=torch.bool, device=device)
+    train_mask[sorted({int(entry["label"]) for entry in train_entries})] = True
+    STATE.update(
+        seen_mask=train_mask,
+        gamma=0.0,
+        stage="pretrain" if checkpoint_path.name.startswith("pretrain") else "finetune",
+        out_dir=checkpoint_path.parent,
+    )
+    history_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_history.jsonl")
+    monitor_mode, default_delta = MONITORS[SETTINGS.monitor]
+    min_delta = default_delta if SETTINGS.min_delta is None else SETTINGS.min_delta
+    if verbose:
+        print(
+            f"Training classes: {int(train_mask.sum())}/{num_classes} (CE denominators "
+            f"{'limited to training classes' if SETTINGS.ce_train_classes_only else 'cover all classes'}); "
+            f"validation seen={len(seen_validation)} unseen={len(unseen_validation)}; "
+            f"monitor={SETTINGS.monitor} ({monitor_mode}, min_delta={min_delta})."
+        )
 
     backbone_params = [p for name, p in model.named_parameters() if name.startswith("backbone.")]
     head_params = [p for name, p in model.named_parameters() if not name.startswith("backbone.")]
@@ -219,13 +432,14 @@ def train_vit_on_dataset(
         weight_decay=SETTINGS.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=SETTINGS.lr_patience, threshold=SETTINGS.min_delta,
+        optimizer, mode=monitor_mode, factor=0.5, patience=SETTINGS.lr_patience, threshold=min_delta,
         threshold_mode="abs", cooldown=1, min_lr=[1e-6, 1e-5],
     )
     steps_per_epoch = max(1, len(train_loader))
     warmup_steps = min(SETTINGS.warmup_steps, steps_per_epoch)
     criterion = nn.CrossEntropyLoss()
-    best_seen_loss = float("inf")
+    best_metric = float("-inf") if monitor_mode == "max" else float("inf")
+    best_gamma = 0.0
     best_accuracy = -1.0
     best_epoch = -1
     best_state_dict: dict[str, torch.Tensor] | None = None
@@ -242,10 +456,12 @@ def train_vit_on_dataset(
                 base.move_optimizer_state_to_device(optimizer, device)
             if isinstance(state.get("scheduler_state_dict"), dict):
                 scheduler.load_state_dict(state["scheduler_state_dict"])
-            best_seen_loss = float(state.get("best_seen_loss", best_seen_loss))
+            if state.get("monitor") == SETTINGS.monitor:
+                best_metric = float(state.get("best_metric", best_metric))
+                best_gamma = float(state.get("best_gamma", best_gamma))
+                epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
             best_accuracy = float(state.get("best_accuracy", best_accuracy))
             best_epoch = int(state.get("best_epoch", best_epoch))
-            epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
             start_epoch = int(state.get("epoch", 0)) + 1
             if verbose:
                 print(f"Resumed training from {state_path} at epoch {start_epoch}")
@@ -256,8 +472,11 @@ def train_vit_on_dataset(
         if checkpoint_path.exists():
             best_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             best_state_dict = best_state.get("state_dict") if isinstance(best_state, dict) else None
+            if isinstance(best_state, dict):
+                best_gamma = float(best_state.get("gamma", best_gamma))
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
+        STATE["gamma"] = best_gamma
         return best_accuracy, best_epoch
 
     for epoch in range(start_epoch, epochs + 1):
@@ -280,6 +499,8 @@ def train_vit_on_dataset(
             bounded_logits = model.bound(raw_logits)
             encoded = base.STEBinarize.apply(bounded_logits)
             class_scores = base.codebook_logits(encoded, codebook_matrix, structured_codebook)
+            if SETTINGS.ce_train_classes_only:
+                class_scores = class_scores.masked_fill(~train_mask.unsqueeze(0), float("-inf"))
             classification_loss = criterion(class_scores, labels)
             targets = codebook_matrix.index_select(0, labels)
             valid_bits = targets.ne(0)
@@ -309,8 +530,11 @@ def train_vit_on_dataset(
 
         averages = {key: value / max(1, seen) for key, value in totals.items()}
         train_loss = averages["total"]
-        val_loss, val_accuracy = base.evaluate(model, val_loader, codebook_matrix, device, structured_codebook)
-        scheduler.step(val_loss)
+        seen_stats = evaluate_group(model, val_seen_loader, codebook_matrix, structured_codebook, device, train_mask, False)
+        unseen_stats = evaluate_group(model, val_unseen_loader, codebook_matrix, structured_codebook, device, train_mask, True)
+        metrics = summarize_validation(seen_stats, unseen_stats)
+        monitored = metrics[SETTINGS.monitor]
+        scheduler.step(monitored)
         learning_rates = ",".join(f"{group['lr']:.2e}" for group in optimizer.param_groups)
         if verbose:
             aug_label = "on" if SETTINGS.augmentation else "off"
@@ -320,21 +544,29 @@ def train_vit_on_dataset(
                 f"Epoch {epoch:03d}/{epochs:03d} | train_loss={train_loss:.4f} | "
                 f"train_cls_loss={averages['cls']:.4f} | {aux_text}"
                 f"mean_abs_raw_logit={averages['abs_logit']:.1f} | bit_error={averages['bit_error']:.3f} | "
-                f"val_seen_loss={val_loss:.4f} | val_seen_acc={val_accuracy:.4f} | "
-                f"lr={learning_rates} | aug={aug_label} | aux={aux_label}"
+                f"val_seen_loss={metrics['val_seen_loss']:.4f} | val_seen_acc={metrics['val_seen_acc']:.4f} | "
+                f"val_unseen_loss={metrics['val_unseen_loss']:.4f} | val_unseen_zsl_acc={metrics['val_unseen_zsl_acc']:.4f} | "
+                f"val_unseen_gzsl_acc={metrics['val_unseen_gzsl_acc']:.4f} | into_seen={metrics['val_unseen_into_seen']:.3f} | "
+                f"cs_gamma={metrics['cs_gamma']:g} | cs_seen={metrics['cs_seen_acc']:.4f} | cs_unseen={metrics['cs_unseen_acc']:.4f} | "
+                f"val_h={metrics['val_h']:.4f} | lr={learning_rates} | aug={aug_label} | aux={aux_label}"
             )
+        with history_path.open("a", encoding="utf-8") as history:
+            history.write(json.dumps({"epoch": epoch, "stage": STATE["stage"], **{f"train_{k}": v for k, v in averages.items()}, **metrics, "lr": learning_rates}) + "\n")
 
-        if val_loss < best_seen_loss - SETTINGS.min_delta:
-            best_seen_loss = val_loss
-            best_accuracy = val_accuracy
+        if is_improvement(monitored, best_metric, monitor_mode, min_delta):
+            best_metric = monitored
+            best_gamma = metrics["cs_gamma"]
+            best_accuracy = metrics["val_h"]
             best_epoch = epoch
             epochs_without_improvement = 0
             best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             torch.save(
                 {
                     "epoch": epoch,
-                    "val_seen_loss": val_loss,
-                    "val_accuracy": val_accuracy,
+                    "monitor": SETTINGS.monitor,
+                    "monitor_value": monitored,
+                    "gamma": best_gamma,
+                    "val_metrics": metrics,
                     "class_to_index": class_to_index,
                     "codebook_dim": codebook_matrix.shape[1],
                     "state_dict": best_state_dict,
@@ -349,7 +581,9 @@ def train_vit_on_dataset(
                 "epoch": epoch,
                 "best_epoch": best_epoch,
                 "best_accuracy": best_accuracy,
-                "best_seen_loss": best_seen_loss,
+                "best_metric": best_metric,
+                "best_gamma": best_gamma,
+                "monitor": SETTINGS.monitor,
                 "epochs_without_improvement": epochs_without_improvement,
                 "class_to_index": class_to_index,
                 "codebook_dim": codebook_matrix.shape[1],
@@ -361,16 +595,20 @@ def train_vit_on_dataset(
             state_path,
         )
         if epochs_without_improvement >= SETTINGS.patience:
-            print(f"Early stopping: val_seen_loss did not improve for {SETTINGS.patience} epochs.")
+            print(f"Early stopping: {SETTINGS.monitor} did not improve for {SETTINGS.patience} epochs.")
             break
 
     if best_state_dict is None:
         if checkpoint_path.exists():
             saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             best_state_dict = saved.get("state_dict") if isinstance(saved, dict) else None
+            if isinstance(saved, dict):
+                best_gamma = float(saved.get("gamma", best_gamma))
     if best_state_dict is None:
         raise RuntimeError("No best ViT checkpoint was saved.")
     model.load_state_dict(best_state_dict)
+    STATE["gamma"] = best_gamma
+    print(f"Restored best epoch {best_epoch} ({SETTINGS.monitor}={best_metric:.4f}); calibrated-stacking gamma={best_gamma:g}.")
     return best_accuracy, best_epoch
 
 
@@ -388,6 +626,12 @@ def main() -> None:
     parser.add_argument("--vit-logit-bound", type=float, default=SETTINGS.logit_bound)
     parser.add_argument("--vit-warmup-steps", type=int, default=SETTINGS.warmup_steps)
     parser.add_argument("--lr-scheduler-patience", type=int, default=SETTINGS.lr_patience)
+    parser.add_argument("--monitor", choices=sorted(MONITORS), default=SETTINGS.monitor, help="Validation metric for model selection, LR decay and early stopping.")
+    parser.add_argument("--ce-train-classes-only", action=argparse.BooleanOptionalAction, default=SETTINGS.ce_train_classes_only, help="Restrict the training CE denominator to classes present in the training set.")
+    parser.add_argument("--kana-max-samples-per-class", type=int, default=SETTINGS.kana_cap, help="Cap on kana training samples per class (0 disables the cap).")
+    parser.add_argument("--val-max-samples", type=int, default=SETTINGS.val_max_samples, help="Max validation samples per group (seen/unseen) per epoch; 0 uses all.")
+    parser.add_argument("--init-from", default=None, help="Initialize from a checkpoint (e.g. pretrain_best_fare_model.pth); skips pretraining.")
+    parser.add_argument("--disjoint-unseen", action=argparse.BooleanOptionalAction, default=SETTINGS.disjoint_unseen, help="Split unseen classes (not samples) between validation and test.")
     options, remaining = parser.parse_known_args()
     SETTINGS.lr = options.vit_lr
     SETTINGS.head_lr = options.vit_head_lr
@@ -401,6 +645,12 @@ def main() -> None:
     SETTINGS.logit_bound = options.vit_logit_bound
     SETTINGS.warmup_steps = options.vit_warmup_steps
     SETTINGS.lr_patience = options.lr_scheduler_patience
+    SETTINGS.monitor = options.monitor
+    SETTINGS.ce_train_classes_only = options.ce_train_classes_only
+    SETTINGS.kana_cap = options.kana_max_samples_per_class
+    SETTINGS.val_max_samples = options.val_max_samples
+    SETTINGS.init_from = options.init_from
+    SETTINGS.disjoint_unseen = options.disjoint_unseen
     sys.argv = [sys.argv[0], *remaining]
 
     original_parse_args = base.parse_args
@@ -408,6 +658,8 @@ def main() -> None:
 
     def parse_args_with_early_stopping() -> argparse.Namespace:
         args = original_parse_args()
+        if SETTINGS.init_from and args.pretrain_root:
+            raise SystemExit("--init-from skips pretraining; do not pass --pretrain-root together with it.")
         if "--epochs" not in sys.argv:
             args.epochs = 100
         if args.pretrain_root and "--pretrain-epochs" not in sys.argv:
@@ -422,13 +674,19 @@ def main() -> None:
             "image_size": IMAGE_SIZE,
             "output_code_bits": 400,
             "kuzushiji_kana_forced_seen": True,
+            "kana_max_samples_per_class": SETTINGS.kana_cap,
+            "ce_train_classes_only": SETTINGS.ce_train_classes_only,
+            "disjoint_unseen_val_test_classes": SETTINGS.disjoint_unseen,
+            "init_from": SETTINGS.init_from,
+            "validation_max_samples_per_group": SETTINGS.val_max_samples,
+            "calibrated_stacking_gamma_grid": list(GAMMA_GRID),
             "auxiliary_bce_enabled": SETTINGS.aux_loss,
             "auxiliary_bce_weight": SETTINGS.aux_weight,
             "augmentation_enabled": SETTINGS.augmentation,
             "backbone_learning_rate": SETTINGS.lr,
             "projection_learning_rate": SETTINGS.head_lr,
             "weight_decay": SETTINGS.weight_decay,
-            "early_stopping_monitor": "seen_validation_loss",
+            "early_stopping_monitor": SETTINGS.monitor,
             "early_stopping_patience": SETTINGS.patience,
             "early_stopping_min_delta": SETTINGS.min_delta,
             "scheduler": "ReduceLROnPlateau",
@@ -440,9 +698,10 @@ def main() -> None:
 
     base.parse_args = parse_args_with_early_stopping
     base.save_json = save_json_with_vit_settings
-    base.FareRecognitionModel = ViTFareRecognitionModel
+    base.FareRecognitionModel = make_model
     base.CharacterImageDataset = ViTCharacterDataset
     base.train_model_on_dataset = train_vit_on_dataset
+    base.evaluate_entries = evaluate_entries_extended
     torch.set_float32_matmul_precision("high")
     base.main()
 
