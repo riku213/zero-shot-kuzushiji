@@ -4,6 +4,7 @@ import argparse
 import collections
 import importlib.util
 import json
+import pickle
 import random
 import sys
 import unicodedata
@@ -22,6 +23,7 @@ spec = importlib.util.spec_from_file_location("train_model_6", SRC_DIR / "6_trai
 base = importlib.util.module_from_spec(spec)
 sys.modules["train_model_6"] = base
 spec.loader.exec_module(base)
+from structured_codebook import STRUCTURE_SET, tokenize_ids  # noqa: E402  (src is on sys.path once 6_train_model is loaded)
 
 IMAGE_SIZE = 224
 SETTINGS = argparse.Namespace(
@@ -43,14 +45,21 @@ SETTINGS = argparse.Namespace(
     val_max_samples=20000,
     init_from=None,
     disjoint_unseen=True,
+    component_head=True,
+    component_weight=1.0,
+    component_min_count=1,
+    component_unknown_logp=-9.0,
+    codebook_path=None,
 )
 
 # Penalties subtracted from seen-class scores (calibrated stacking); candidates for the validation grid search.
 GAMMA_GRID = (0.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0)
+# Weights of the component log-probability score added to the FaRE code score (0 = FaRE only).
+LAMBDA_GRID = (0.0, 1.0, 2.0, 4.0, 8.0)
 # (mode, default min_delta) per monitored validation metric.
 MONITORS = {"val_h": ("max", 0.002), "val_unseen_zsl_acc": ("max", 0.002), "val_seen_loss": ("min", 0.01)}
 # Shared between the training function and the patched test evaluation.
-STATE: dict[str, Any] = {"seen_mask": None, "gamma": 0.0, "stage": "", "out_dir": None}
+STATE: dict[str, Any] = {"seen_mask": None, "gamma": 0.0, "lambda": 0.0, "stage": "", "out_dir": None, "components": None}
 
 
 def is_kana_label(label: str) -> bool:
@@ -200,15 +209,38 @@ class ViTFareRecognitionModel(nn.Module):
         self.backbone = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
         self.backbone.heads = nn.Identity()
         self.projection = nn.Linear(768, codebook_dim)
+        self.component_head: nn.Linear | None = None  # attached once the training-set vocabulary is known
         self.logit_bound = float(SETTINGS.logit_bound)
 
-    def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
+    def load_state_dict(self, state_dict: Any, strict: bool = True, **kwargs: Any) -> Any:
+        weight = state_dict.get("component_head.weight")
+        if weight is not None and self.component_head is None:
+            self.component_head = nn.Linear(weight.shape[1], weight.shape[0]).to(self.projection.weight.device)
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
             x = F.interpolate(x, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False)
         with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=x.is_cuda):
-            features = self.backbone(x)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            return self.projection(features.float())
+            return self.backbone(x).float()
+
+    def project_bits(self, features: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            return self.projection(features)
+
+    def project_components(self, features: torch.Tensor) -> torch.Tensor | None:
+        if self.component_head is None:
+            return None
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            return self.component_head(features)
+
+    def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project_bits(self.forward_features(x))
+
+    def forward_all(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        features = self.forward_features(x)
+        bits = base.STEBinarize.apply(self.bound(self.project_bits(features)))
+        return bits, self.project_components(features)
 
     def bound(self, raw: torch.Tensor) -> torch.Tensor:
         # Sign is unchanged; the gradient shrinks as |raw| grows, which stops logit growth through the STE.
@@ -239,22 +271,37 @@ def evaluate_group(
     device: torch.device,
     seen_mask: torch.Tensor,
     unseen_group: bool,
-    gamma: float | None = None,
+    pairs: tuple[tuple[float, float], ...] | None = None,
 ) -> dict[str, Any]:
-    """One pass over a group of samples: all-class (GZSL), closed-set, and calibrated-stacking accuracy."""
+    """One pass over a group of samples: all-class (GZSL), closed-set, calibrated-stacking and component-fused accuracy."""
     model.eval()
+    components = STATE["components"]
+    lambdas = LAMBDA_GRID if components is not None else (0.0,)
+    if pairs is None:
+        pairs = tuple((lam, gam) for lam in lambdas for gam in GAMMA_GRID)
     totals: collections.Counter = collections.Counter()
-    gamma_correct: collections.Counter = collections.Counter()
+    pair_correct: collections.Counter = collections.Counter()
+    closed_correct: collections.Counter = collections.Counter()
     pool = ~seen_mask if unseen_group else seen_mask
     seen_float = seen_mask.float().unsqueeze(0)
-    grid = GAMMA_GRID if gamma is None else tuple(sorted({0.0, float(gamma)}))
+    closed_lambdas = sorted({0.0, *(lam for lam, _ in pairs)})
     if loader is not None:
         for batch in loader:
             if batch is None:
                 continue
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
-            scores = base.codebook_logits(model(images), matrix, structured)
+            bits, component_logits = model.forward_all(images)
+            scores = base.codebook_logits(bits, matrix, structured)
+            component_scores = None
+            if components is not None and component_logits is not None:
+                log_probs = F.log_softmax(component_logits.float(), dim=1)
+                component_scores = log_probs @ components["score_matrix"] + components["unknown_score"]
+                known = components["targets"].index_select(0, labels)
+                has_known = known.sum(1) > 0
+                hits = known.gather(1, log_probs.topk(5, dim=1).indices).sum(1) / known.sum(1).clamp_min(1)
+                totals["comp_n"] += has_known.sum().item()
+                totals["comp_recall5"] += (hits * has_known).sum().item()
             predictions = scores.argmax(1)
             correct = predictions == labels
             closed_scores = scores.masked_fill(~pool.unsqueeze(0), float("-inf"))
@@ -264,13 +311,15 @@ def evaluate_group(
             totals["ce_all"] += F.cross_entropy(scores, labels, reduction="sum").item()
             totals["ce_closed"] += closed_ce.clamp(max=100.0).sum().item()
             totals["correct"] += correct.sum().item()
-            totals["closed_correct"] += (closed_scores.argmax(1) == labels).sum().item()
             totals["into_seen"] += seen_mask[predictions].sum().item()
             totals["kana_n"] += kana.sum().item()
             totals["kana_correct"] += (correct & kana).sum().item()
-            for value in grid:
-                adjusted = scores - value * seen_float
-                gamma_correct[value] += (adjusted.argmax(1) == labels).sum().item()
+            for lam in closed_lambdas:
+                fused = scores if lam == 0.0 or component_scores is None else scores + lam * component_scores
+                closed_correct[lam] += (fused.masked_fill(~pool.unsqueeze(0), float("-inf")).argmax(1) == labels).sum().item()
+            for lam, gam in pairs:
+                fused = scores if lam == 0.0 or component_scores is None else scores + lam * component_scores
+                pair_correct[(lam, gam)] += ((fused - gam * seen_float).argmax(1) == labels).sum().item()
     n = totals["n"]
     kanji_n = n - totals["kana_n"]
     return {
@@ -278,11 +327,49 @@ def evaluate_group(
         "loss_all": totals["ce_all"] / max(1, n),
         "acc": totals["correct"] / max(1, n),
         "closed_loss": totals["ce_closed"] / max(1, n),
-        "closed_acc": totals["closed_correct"] / max(1, n),
+        "closed_acc": closed_correct[0.0] / max(1, n),
+        "closed_acc_by_lambda": {lam: closed_correct[lam] / max(1, n) for lam in closed_lambdas},
         "into_seen": totals["into_seen"] / max(1, n),
         "kana_acc": totals["kana_correct"] / totals["kana_n"] if totals["kana_n"] else None,
         "kanji_acc": (totals["correct"] - totals["kana_correct"]) / kanji_n if kanji_n else None,
-        "gamma_acc": {value: gamma_correct[value] / max(1, n) for value in grid},
+        "comp_recall5": totals["comp_recall5"] / totals["comp_n"] if totals["comp_n"] else None,
+        "pair_acc": {pair: pair_correct[pair] / max(1, n) for pair in pairs},
+    }
+
+
+def build_component_assets(
+    class_to_index: dict[str, int], train_label_ids: set[int], device: torch.device
+) -> dict[str, Any] | None:
+    """Component vocabulary from training classes, plus per-class target and scoring matrices."""
+    with open(SETTINGS.codebook_path, "rb") as handle:
+        entries = pickle.load(handle)["entries"]
+    names = [""] * len(class_to_index)
+    for name, index in class_to_index.items():
+        names[index] = name
+    leaves = [
+        sorted({token for token in tokenize_ids(entries[name]["polish"]) if token not in STRUCTURE_SET}) if name in entries else []
+        for name in names
+    ]
+    counts = collections.Counter(token for index in train_label_ids for token in leaves[index])
+    vocabulary = sorted(token for token, count in counts.items() if count >= SETTINGS.component_min_count)
+    if not vocabulary:
+        return None
+    position = {token: i for i, token in enumerate(vocabulary)}
+    targets = torch.zeros(len(names), len(vocabulary))
+    unknown = torch.zeros(len(names))
+    sizes = torch.tensor([max(1, len(items)) for items in leaves], dtype=torch.float32)
+    for index, items in enumerate(leaves):
+        for token in items:
+            if token in position:
+                targets[index, position[token]] = 1.0
+            else:
+                unknown[index] += 1.0
+    return {
+        "vocabulary": vocabulary,
+        "targets": targets.to(device),
+        "score_matrix": (targets / sizes.unsqueeze(1)).t().contiguous().to(device),
+        "unknown_score": (unknown * SETTINGS.component_unknown_logp / sizes).to(device),
+        "unknown_count": int((unknown > 0).sum().item()),
     }
 
 
@@ -291,23 +378,33 @@ def harmonic_mean(first: float, second: float) -> float:
 
 
 def summarize_validation(seen: dict[str, Any], unseen: dict[str, Any]) -> dict[str, float]:
-    best_h, best_gamma = -1.0, 0.0
-    for value in GAMMA_GRID:
-        h = harmonic_mean(seen["gamma_acc"][value], unseen["gamma_acc"][value])
+    best_h, best_pair = -1.0, (0.0, 0.0)
+    best_fare_only = 0.0
+    for pair, seen_acc in seen["pair_acc"].items():
+        h = harmonic_mean(seen_acc, unseen["pair_acc"].get(pair, 0.0))
+        if pair[0] == 0.0:
+            best_fare_only = max(best_fare_only, h)
         if h > best_h:
-            best_h, best_gamma = h, value
+            best_h, best_pair = h, pair
+    best_lambda, best_gamma = best_pair
+    nan = float("nan")
     return {
         "val_seen_loss": seen["loss_all"],
         "val_seen_acc": seen["acc"],
-        "val_seen_kanji_acc": seen["kanji_acc"] if seen["kanji_acc"] is not None else float("nan"),
+        "val_seen_kanji_acc": seen["kanji_acc"] if seen["kanji_acc"] is not None else nan,
         "val_unseen_loss": unseen["loss_all"],
         "val_unseen_zsl_loss": unseen["closed_loss"],
         "val_unseen_zsl_acc": unseen["closed_acc"],
+        "val_unseen_zsl_acc_fused": unseen["closed_acc_by_lambda"].get(best_lambda, unseen["closed_acc"]),
         "val_unseen_gzsl_acc": unseen["acc"],
         "val_unseen_into_seen": unseen["into_seen"],
+        "val_seen_comp_recall5": seen["comp_recall5"] if seen["comp_recall5"] is not None else nan,
+        "val_unseen_comp_recall5": unseen["comp_recall5"] if unseen["comp_recall5"] is not None else nan,
+        "cs_lambda": best_lambda,
         "cs_gamma": best_gamma,
-        "cs_seen_acc": seen["gamma_acc"][best_gamma],
-        "cs_unseen_acc": unseen["gamma_acc"][best_gamma],
+        "cs_seen_acc": seen["pair_acc"][best_pair],
+        "cs_unseen_acc": unseen["pair_acc"].get(best_pair, 0.0),
+        "val_h_fare_only": best_fare_only,
         "val_h": max(best_h, 0.0),
     }
 
@@ -332,21 +429,33 @@ def evaluate_entries_extended(
         pin_memory=device.type == "cuda",
         collate_fn=base.safe_collate,
     )
-    stats = evaluate_group(model, loader, codebook, structured_codebook, device, seen_mask, unseen_group, STATE["gamma"])
-    gamma = STATE["gamma"]
+    stats = evaluate_group(
+        model, loader, codebook, structured_codebook, device, seen_mask, unseen_group,
+        pairs=((0.0, 0.0), (STATE["lambda"], STATE["gamma"])),
+    )
+    gamma, lam = STATE["gamma"], STATE["lambda"]
     stage = STATE["stage"]
     kanji = "n/a" if stats["kanji_acc"] is None else f"{stats['kanji_acc']:.4f}"
     kana = "n/a" if stats["kana_acc"] is None else f"{stats['kana_acc']:.4f}"
+    recall = "n/a" if stats["comp_recall5"] is None else f"{stats['comp_recall5']:.4f}"
+    fused_closed = stats["closed_acc_by_lambda"].get(lam, stats["closed_acc"])
     print(
         f"[extended {stage}/{split}] n={stats['n']} gzsl_acc={stats['acc']:.4f} "
         f"{'zsl_acc' if unseen_group else 'seen_closed_acc'}={stats['closed_acc']:.4f} "
-        f"calibrated(gamma={gamma:g})_acc={stats['gamma_acc'][gamma]:.4f} "
-        f"predicted_into_seen={stats['into_seen']:.3f} kanji_acc={kanji} kana_acc={kana}"
+        f"{'zsl_acc' if unseen_group else 'seen_closed_acc'}_fused(lambda={lam:g})={fused_closed:.4f} "
+        f"calibrated(lambda={lam:g},gamma={gamma:g})_acc={stats['pair_acc'][(lam, gamma)]:.4f} "
+        f"predicted_into_seen={stats['into_seen']:.3f} component_recall5={recall} kanji_acc={kanji} kana_acc={kana}"
     )
     if STATE["out_dir"] is not None:
         path = Path(STATE["out_dir"]) / "extended_test_metrics.json"
         results = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        results[f"{stage}/{split}"] = {**stats, "gamma": gamma, "gamma_acc": {str(k): v for k, v in stats["gamma_acc"].items()}}
+        results[f"{stage}/{split}"] = {
+            **stats,
+            "lambda": lam,
+            "gamma": gamma,
+            "closed_acc_by_lambda": {str(k): v for k, v in stats["closed_acc_by_lambda"].items()},
+            "pair_acc": {f"lambda={k[0]:g},gamma={k[1]:g}": v for k, v in stats["pair_acc"].items()},
+        }
         path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     return stats["loss_all"], stats["acc"]
 
@@ -408,18 +517,32 @@ def train_vit_on_dataset(
     STATE.update(
         seen_mask=train_mask,
         gamma=0.0,
+        **{"lambda": 0.0},
         stage="pretrain" if checkpoint_path.name.startswith("pretrain") else "finetune",
         out_dir=checkpoint_path.parent,
+        components=None,
     )
+    if SETTINGS.component_head:
+        components = build_component_assets(class_to_index, {int(entry["label"]) for entry in train_entries}, device)
+        if components is not None:
+            STATE["components"] = components
+            if model.component_head is None:
+                model.component_head = nn.Linear(768, len(components["vocabulary"])).to(device)
     history_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_history.jsonl")
     monitor_mode, default_delta = MONITORS[SETTINGS.monitor]
     min_delta = default_delta if SETTINGS.min_delta is None else SETTINGS.min_delta
     if verbose:
+        vocabulary_text = (
+            f"component head: {len(STATE['components']['vocabulary'])} components, "
+            f"{STATE['components']['unknown_count']} classes contain a component outside the vocabulary"
+            if STATE["components"] is not None
+            else "component head: off"
+        )
         print(
             f"Training classes: {int(train_mask.sum())}/{num_classes} (CE denominators "
             f"{'limited to training classes' if SETTINGS.ce_train_classes_only else 'cover all classes'}); "
             f"validation seen={len(seen_validation)} unseen={len(unseen_validation)}; "
-            f"monitor={SETTINGS.monitor} ({monitor_mode}, min_delta={min_delta})."
+            f"monitor={SETTINGS.monitor} ({monitor_mode}, min_delta={min_delta}); {vocabulary_text}."
         )
 
     backbone_params = [p for name, p in model.named_parameters() if name.startswith("backbone.")]
@@ -440,6 +563,7 @@ def train_vit_on_dataset(
     criterion = nn.CrossEntropyLoss()
     best_metric = float("-inf") if monitor_mode == "max" else float("inf")
     best_gamma = 0.0
+    best_lambda = 0.0
     best_accuracy = -1.0
     best_epoch = -1
     best_state_dict: dict[str, torch.Tensor] | None = None
@@ -459,6 +583,7 @@ def train_vit_on_dataset(
             if state.get("monitor") == SETTINGS.monitor:
                 best_metric = float(state.get("best_metric", best_metric))
                 best_gamma = float(state.get("best_gamma", best_gamma))
+                best_lambda = float(state.get("best_lambda", best_lambda))
                 epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
             best_accuracy = float(state.get("best_accuracy", best_accuracy))
             best_epoch = int(state.get("best_epoch", best_epoch))
@@ -474,14 +599,16 @@ def train_vit_on_dataset(
             best_state_dict = best_state.get("state_dict") if isinstance(best_state, dict) else None
             if isinstance(best_state, dict):
                 best_gamma = float(best_state.get("gamma", best_gamma))
+                best_lambda = float(best_state.get("lambda", best_lambda))
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
         STATE["gamma"] = best_gamma
+        STATE["lambda"] = best_lambda
         return best_accuracy, best_epoch
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
-        totals = {"total": 0.0, "cls": 0.0, "aux": 0.0, "abs_logit": 0.0, "bit_error": 0.0}
+        totals = {"total": 0.0, "cls": 0.0, "aux": 0.0, "comp": 0.0, "abs_logit": 0.0, "bit_error": 0.0}
         seen = 0
         for batch_index, batch in enumerate(tqdm(train_loader, desc=f"Train E{epoch}", leave=False)):
             if batch is None:
@@ -495,7 +622,8 @@ def train_vit_on_dataset(
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            raw_logits = model.forward_raw(images)
+            features = model.forward_features(images)
+            raw_logits = model.project_bits(features)
             bounded_logits = model.bound(raw_logits)
             encoded = base.STEBinarize.apply(bounded_logits)
             class_scores = base.codebook_logits(encoded, codebook_matrix, structured_codebook)
@@ -504,15 +632,24 @@ def train_vit_on_dataset(
             classification_loss = criterion(class_scores, labels)
             targets = codebook_matrix.index_select(0, labels)
             valid_bits = targets.ne(0)
+            loss = classification_loss
             if SETTINGS.aux_loss:
                 binary_targets = targets.gt(0).to(bounded_logits.dtype)
                 bit_loss = F.binary_cross_entropy_with_logits(bounded_logits, binary_targets, reduction="none")
                 per_sample_aux = (bit_loss * valid_bits).sum(dim=1) / valid_bits.sum(dim=1).clamp_min(1)
                 auxiliary_loss = per_sample_aux.mean()
-                loss = classification_loss + SETTINGS.aux_weight * auxiliary_loss
+                loss = loss + SETTINGS.aux_weight * auxiliary_loss
             else:
                 auxiliary_loss = bounded_logits.new_zeros(())
-                loss = classification_loss
+            component_loss = bounded_logits.new_zeros(())
+            component_logits = model.project_components(features)
+            if component_logits is not None:
+                component_targets = STATE["components"]["targets"].index_select(0, labels)
+                positives = component_targets.sum(dim=1)
+                has_positive = positives > 0
+                per_sample = -(F.log_softmax(component_logits, dim=1) * component_targets).sum(dim=1) / positives.clamp_min(1)
+                component_loss = (per_sample * has_positive).sum() / has_positive.sum().clamp_min(1)
+                loss = loss + SETTINGS.component_weight * component_loss
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -524,6 +661,7 @@ def train_vit_on_dataset(
             totals["total"] += loss.item() * batch_size_now
             totals["cls"] += classification_loss.item() * batch_size_now
             totals["aux"] += auxiliary_loss.item() * batch_size_now
+            totals["comp"] += component_loss.item() * batch_size_now
             totals["abs_logit"] += raw_logits.detach().abs().mean().item() * batch_size_now
             totals["bit_error"] += bit_error.item() * batch_size_now
             seen += batch_size_now
@@ -540,14 +678,22 @@ def train_vit_on_dataset(
             aug_label = "on" if SETTINGS.augmentation else "off"
             aux_label = "on" if SETTINGS.aux_loss else "off"
             aux_text = f"train_aux_loss={averages['aux']:.4f} | " if SETTINGS.aux_loss else ""
+            comp_text = (
+                f"train_comp_loss={averages['comp']:.4f} | comp_recall5 seen={metrics['val_seen_comp_recall5']:.3f} "
+                f"unseen={metrics['val_unseen_comp_recall5']:.3f} | "
+                if STATE["components"] is not None
+                else ""
+            )
             print(
                 f"Epoch {epoch:03d}/{epochs:03d} | train_loss={train_loss:.4f} | "
-                f"train_cls_loss={averages['cls']:.4f} | {aux_text}"
+                f"train_cls_loss={averages['cls']:.4f} | {aux_text}{comp_text}"
                 f"mean_abs_raw_logit={averages['abs_logit']:.1f} | bit_error={averages['bit_error']:.3f} | "
                 f"val_seen_loss={metrics['val_seen_loss']:.4f} | val_seen_acc={metrics['val_seen_acc']:.4f} | "
                 f"val_unseen_loss={metrics['val_unseen_loss']:.4f} | val_unseen_zsl_acc={metrics['val_unseen_zsl_acc']:.4f} | "
+                f"val_unseen_zsl_acc_fused={metrics['val_unseen_zsl_acc_fused']:.4f} | "
                 f"val_unseen_gzsl_acc={metrics['val_unseen_gzsl_acc']:.4f} | into_seen={metrics['val_unseen_into_seen']:.3f} | "
-                f"cs_gamma={metrics['cs_gamma']:g} | cs_seen={metrics['cs_seen_acc']:.4f} | cs_unseen={metrics['cs_unseen_acc']:.4f} | "
+                f"cs_lambda={metrics['cs_lambda']:g} | cs_gamma={metrics['cs_gamma']:g} | cs_seen={metrics['cs_seen_acc']:.4f} | "
+                f"cs_unseen={metrics['cs_unseen_acc']:.4f} | val_h_fare_only={metrics['val_h_fare_only']:.4f} | "
                 f"val_h={metrics['val_h']:.4f} | lr={learning_rates} | aug={aug_label} | aux={aux_label}"
             )
         with history_path.open("a", encoding="utf-8") as history:
@@ -556,6 +702,7 @@ def train_vit_on_dataset(
         if is_improvement(monitored, best_metric, monitor_mode, min_delta):
             best_metric = monitored
             best_gamma = metrics["cs_gamma"]
+            best_lambda = metrics["cs_lambda"]
             best_accuracy = metrics["val_h"]
             best_epoch = epoch
             epochs_without_improvement = 0
@@ -566,6 +713,8 @@ def train_vit_on_dataset(
                     "monitor": SETTINGS.monitor,
                     "monitor_value": monitored,
                     "gamma": best_gamma,
+                    "lambda": best_lambda,
+                    "component_vocabulary": STATE["components"]["vocabulary"] if STATE["components"] is not None else None,
                     "val_metrics": metrics,
                     "class_to_index": class_to_index,
                     "codebook_dim": codebook_matrix.shape[1],
@@ -583,6 +732,7 @@ def train_vit_on_dataset(
                 "best_accuracy": best_accuracy,
                 "best_metric": best_metric,
                 "best_gamma": best_gamma,
+                "best_lambda": best_lambda,
                 "monitor": SETTINGS.monitor,
                 "epochs_without_improvement": epochs_without_improvement,
                 "class_to_index": class_to_index,
@@ -604,11 +754,16 @@ def train_vit_on_dataset(
             best_state_dict = saved.get("state_dict") if isinstance(saved, dict) else None
             if isinstance(saved, dict):
                 best_gamma = float(saved.get("gamma", best_gamma))
+                best_lambda = float(saved.get("lambda", best_lambda))
     if best_state_dict is None:
         raise RuntimeError("No best ViT checkpoint was saved.")
     model.load_state_dict(best_state_dict)
     STATE["gamma"] = best_gamma
-    print(f"Restored best epoch {best_epoch} ({SETTINGS.monitor}={best_metric:.4f}); calibrated-stacking gamma={best_gamma:g}.")
+    STATE["lambda"] = best_lambda
+    print(
+        f"Restored best epoch {best_epoch} ({SETTINGS.monitor}={best_metric:.4f}); "
+        f"calibrated-stacking gamma={best_gamma:g}, component fusion lambda={best_lambda:g}."
+    )
     return best_accuracy, best_epoch
 
 
@@ -632,6 +787,10 @@ def main() -> None:
     parser.add_argument("--val-max-samples", type=int, default=SETTINGS.val_max_samples, help="Max validation samples per group (seen/unseen) per epoch; 0 uses all.")
     parser.add_argument("--init-from", default=None, help="Initialize from a checkpoint (e.g. pretrain_best_fare_model.pth); skips pretraining.")
     parser.add_argument("--disjoint-unseen", action=argparse.BooleanOptionalAction, default=SETTINGS.disjoint_unseen, help="Split unseen classes (not samples) between validation and test.")
+    parser.add_argument("--component-head", action=argparse.BooleanOptionalAction, default=SETTINGS.component_head, help="Add the auxiliary component (bag-of-components) classification head and fuse it at evaluation.")
+    parser.add_argument("--component-loss-weight", type=float, default=SETTINGS.component_weight)
+    parser.add_argument("--component-min-count", type=int, default=SETTINGS.component_min_count, help="Minimum number of training classes a component must appear in to enter the vocabulary.")
+    parser.add_argument("--component-unknown-logp", type=float, default=SETTINGS.component_unknown_logp, help="Log-probability assigned to candidate components outside the vocabulary.")
     options, remaining = parser.parse_known_args()
     SETTINGS.lr = options.vit_lr
     SETTINGS.head_lr = options.vit_head_lr
@@ -651,6 +810,10 @@ def main() -> None:
     SETTINGS.val_max_samples = options.val_max_samples
     SETTINGS.init_from = options.init_from
     SETTINGS.disjoint_unseen = options.disjoint_unseen
+    SETTINGS.component_head = options.component_head
+    SETTINGS.component_weight = options.component_loss_weight
+    SETTINGS.component_min_count = options.component_min_count
+    SETTINGS.component_unknown_logp = options.component_unknown_logp
     sys.argv = [sys.argv[0], *remaining]
 
     original_parse_args = base.parse_args
@@ -658,6 +821,7 @@ def main() -> None:
 
     def parse_args_with_early_stopping() -> argparse.Namespace:
         args = original_parse_args()
+        SETTINGS.codebook_path = args.codebook
         if SETTINGS.init_from and args.pretrain_root:
             raise SystemExit("--init-from skips pretraining; do not pass --pretrain-root together with it.")
         if "--epochs" not in sys.argv:
@@ -680,6 +844,12 @@ def main() -> None:
             "init_from": SETTINGS.init_from,
             "validation_max_samples_per_group": SETTINGS.val_max_samples,
             "calibrated_stacking_gamma_grid": list(GAMMA_GRID),
+            "component_head_enabled": SETTINGS.component_head,
+            "component_loss_weight": SETTINGS.component_weight,
+            "component_min_count": SETTINGS.component_min_count,
+            "component_unknown_logp": SETTINGS.component_unknown_logp,
+            "component_fusion_lambda_grid": list(LAMBDA_GRID),
+            "component_vocabulary_size": len(STATE["components"]["vocabulary"]) if STATE["components"] is not None else 0,
             "auxiliary_bce_enabled": SETTINGS.aux_loss,
             "auxiliary_bce_weight": SETTINGS.aux_weight,
             "augmentation_enabled": SETTINGS.augmentation,
