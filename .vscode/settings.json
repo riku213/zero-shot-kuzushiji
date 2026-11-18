@@ -7,6 +7,10 @@
         "/^c:/Users/kotat/MyPrograms/MyKuzushiji/zero-shot-kuzushiji/\\.venv/Scripts/python\\.exe src/inspect_ids_depth\\.py --samples 80$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^Get-ChildItem outputs -Recurse -File -Filter '\\*radical\\*code\\*' \\| ForEach-Object \\{ '\\{0\\}`t\\{1\\}`t\\{2:yyyy-MM-dd HH:mm:ss\\}' -f \\$_\\.FullName,\\$_\\.Length,\\$_\\.LastWriteTime \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

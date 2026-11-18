@@ -34,9 +34,16 @@ def parse_args() -> argparse.Namespace:
         default="../kuzushiji-recognition/char_sep_datas",
         help="Kuzushiji dataset root containing book/characters/U+XXXX directories.",
     )
-    parser.add_argument("--radical-codes", default="outputs/radical_codes.pkl")
-    parser.add_argument("--render-metadata", default="outputs/radical_render_metadata.json")
-    parser.add_argument("--image-root", default="outputs/radical_images")
+    parser.add_argument(
+        "--radical-codes",
+        default="outputs/261018_cos_median_codebook/all_glyph_codes.pkl",
+        help="64-bit glyph-code dictionary used as terminal codes.",
+    )
+    parser.add_argument(
+        "--render-metadata",
+        default="outputs/261007_correct_dict/combined_render_metadata.json",
+    )
+    parser.add_argument("--image-root", default="outputs/261007_correct_dict")
     parser.add_argument(
         "--max-depth",
         type=int,
@@ -155,6 +162,31 @@ def count_node_types(node: IDSNode) -> tuple[int, int]:
     return structure_count, leaf_count
 
 
+def max_structure_depth(node: IDSNode, depth: int = 0) -> int:
+    if node.symbol not in STRUCTURE_SET:
+        return -1
+    return max([depth, *(max_structure_depth(child, depth + 1) for child in node.children)])
+
+
+def fits_592_layout(
+    node: IDSNode,
+    eligible: set[str],
+    reverse_subtrees: dict[tuple[Any, ...], list[str]],
+) -> bool:
+    def branch_fits(branch: IDSNode) -> bool:
+        if branch.symbol not in STRUCTURE_SET:
+            return branch.symbol in eligible
+        return all(
+            (child.symbol not in STRUCTURE_SET and child.symbol in eligible)
+            or bool(reverse_subtrees.get(canonical_ids(child)))
+            for child in branch.children
+        ) or bool(reverse_subtrees.get(canonical_ids(branch)))
+
+    if node.symbol not in STRUCTURE_SET:
+        return node.symbol in eligible
+    return all(branch_fits(child) for child in node.children)
+
+
 def character_category(character: str) -> str:
     codepoint = ord(character)
     if 0x3040 <= codepoint <= 0x309F:
@@ -259,6 +291,11 @@ def main() -> None:
     overflow_samples: list[tuple[str, int, int, str]] = []
     unresolved_categories: Counter[str] = Counter()
     unresolved_category_samples: defaultdict[str, list[str]] = defaultdict(list)
+    layout_fit_count = 0
+    layout_fit_with_class_fallback_count = 0
+    class_fallback_count = 0
+    layout_failure_reasons: Counter[str] = Counter()
+    layout_failure_samples: list[tuple[str, int, int, int, bool, str]] = []
 
     for character in sorted(dataset_characters, key=ord):
         tree = parsed_ids.get(character, IDSNode(character))
@@ -285,21 +322,32 @@ def main() -> None:
 
         length = code_length(expanded)
         structure_count, leaf_count = count_node_types(expanded)
+        structure_depth = max_structure_depth(expanded)
         exceeds_structures = structure_count > 4
         exceeds_leaves = leaf_count > 9
-        if not exceeds_structures and not exceeds_leaves:
-            capacity_fit_count += 1
+        layout_fits = resolved and fits_592_layout(expanded, eligible, reverse_subtrees)
+        if layout_fits:
+            layout_fit_count += 1
+            layout_fit_with_class_fallback_count += 1
         else:
-            if exceeds_structures and exceeds_leaves:
-                overflow_reasons["structure_and_leaf_slots"] += 1
-            elif exceeds_structures:
-                overflow_reasons["structure_slots"] += 1
-            else:
-                overflow_reasons["leaf_slots"] += 1
-            if len(overflow_samples) < args.samples:
-                overflow_samples.append(
-                    (character, structure_count, leaf_count, ids_to_polish(expanded))
+            reasons = []
+            if not resolved:
+                reasons.append("unresolved_terminal")
+            if structure_depth > 1:
+                reasons.append("operator_below_depth_1")
+            if exceeds_structures:
+                reasons.append("more_than_4_structure_nodes")
+            if exceeds_leaves:
+                reasons.append("more_than_9_leaves")
+            reason = ",".join(reasons)
+            layout_failure_reasons[reason] += 1
+            if len(layout_failure_samples) < args.samples:
+                layout_failure_samples.append(
+                    (character, structure_depth, structure_count, leaf_count, resolved, ids_to_polish(expanded))
                 )
+            if character in eligible:
+                layout_fit_with_class_fallback_count += 1
+                class_fallback_count += 1
 
         if length > maximum_length:
             maximum_length = length
@@ -344,15 +392,22 @@ def main() -> None:
             print(f"  {category}: {count}; {examples}")
     print(f"IDS parse errors in analyzed classes: {sum(ch in parse_errors for ch in dataset_characters)}")
     print(
-        "Fits 592-dimension layout (4 structure slots, 9 leaf slots): "
-        f"{capacity_fit_count}/{total}; does not fit: {total - capacity_fit_count}"
+        "Fits strict 592-dimension layout (operators only at depth 0/1; 4 structure slots; "
+        f"9 leaf slots; all terminals resolved): {layout_fit_count}/{total}; "
+        f"does not fit: {total - layout_fit_count}"
     )
-    print(f"Slot overflow reasons: {dict(overflow_reasons)}")
-    if overflow_samples:
-        print("\n--- Samples that exceed 592-dimension slots ---")
-        for character, structures, leaves, expression in overflow_samples:
+    print(
+        "Fits if a non-fitting class may use its own 64-bit glyph code as SINGLE: "
+        f"{layout_fit_with_class_fallback_count}/{total}; "
+        f"rescued by class-level SINGLE: {class_fallback_count}"
+    )
+    print(f"592-layout failure reasons: {dict(layout_failure_reasons)}")
+    if layout_failure_samples:
+        print("\n--- Samples that do not fit the strict 592-dimension layout ---")
+        for character, depth, structures, leaves, resolved, expression in layout_failure_samples:
             print(
-                f"[{character}] structures={structures}, leaves={leaves}: {expression}"
+                f"[{character}] max_operator_depth={depth}, structures={structures}, "
+                f"leaves={leaves}, terminals_resolved={resolved}: {expression}"
             )
     print(
         "Maximum code length across all effective IDS trees (assuming 64-bit terminal codes): "
