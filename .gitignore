@@ -4,3 +4,5 @@ env/
 dataset/*
 outputs/*
 tmp_test_check/
+AGENTS.md
+docs/
