@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^c:/Users/kotat/MyPrograms/MyKuzushiji/zero-shot-kuzushiji/\\.venv/Scripts/python\\.exe src/inspect_ids_depth\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^c:/Users/kotat/MyPrograms/MyKuzushiji/zero-shot-kuzushiji/\\.venv/Scripts/python\\.exe src/inspect_ids_depth\\.py --samples 80$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
