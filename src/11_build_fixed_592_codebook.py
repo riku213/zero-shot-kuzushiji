@@ -255,6 +255,7 @@ def build_codebook(args: argparse.Namespace) -> dict[str, Any]:
             "metadata": {
                 "character": character,
                 "ids": merged.get(character),
+                "polish": ids_to_polish(original),
                 "effective_ids": ids_to_polish(effective),
                 "source": source,
                 "casia_train_samples": provenance.get("casia_train_samples") if isinstance(provenance, dict) else None,

@@ -75,6 +75,18 @@ def main() -> None:
             raise ValueError(f"Codebook次元が592ではありません: {path}")
         if len(payload.get("codes", {})) != len(payload.get("masks", {})):
             raise ValueError(f"Codebookのcode/mask件数が一致しません: {path}")
+        entries = payload.get("entries", {})
+        missing_polish = [
+            name for name, entry in entries.items()
+            if not isinstance(entry, dict) or "polish" not in entry
+        ]
+        if missing_polish:
+            examples = ", ".join(missing_polish[:5])
+            raise ValueError(
+                f"component head用polish metadataがありません: {path} "
+                f"(不足{len(missing_polish)}件、例: {examples})。"
+                "src/11_build_fixed_592_codebook.pyでcodebookを再生成してください。"
+            )
         excluded = set(payload.get("build", {}).get("excluded_kuzushiji_unicode_keys", []))
         if len(excluded) != 41 or excluded.intersection(payload.get("codes", {})):
             raise ValueError(f"不適合41クラスの除外状態が正しくありません: {path}")
