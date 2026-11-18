@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         help="Match the structured codebook builder's recursion limit (root depth is 1).",
     )
     parser.add_argument("--samples", type=int, default=20, help="Maximum depth-4+ examples to print.")
+    parser.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional Markdown path for a per-class fixed 592-bit layout failure report.",
+    )
     return parser.parse_args()
 
 
@@ -250,6 +255,227 @@ def effective_tree(
     return IDSNode(node.symbol, tuple(expanded_children)), all_resolved
 
 
+def render_ids_tree(node: IDSNode) -> str:
+    lines = [node.symbol]
+    for index, child in enumerate(node.children):
+        is_last = index == len(node.children) - 1
+        child_lines = render_ids_tree(child).splitlines()
+        lines.append(("└─ " if is_last else "├─ ") + child_lines[0])
+        continuation = "   " if is_last else "│  "
+        lines.extend(continuation + line for line in child_lines[1:])
+    return "\n".join(lines)
+
+
+def glyph_label(character: str) -> str:
+    return f"`{character}` ({unicode_key(character)})"
+
+
+def leaf_code_source(
+    node: IDSNode,
+    eligible: set[str],
+    reverse_subtrees: dict[tuple[Any, ...], list[str]],
+) -> str | None:
+    if node.symbol not in STRUCTURE_SET and node.symbol in eligible:
+        return f"direct glyph code for {glyph_label(node.symbol)}"
+    candidates = reverse_subtrees.get(canonical_ids(node), [])
+    if candidates:
+        return f"exact-subtree glyph code for {glyph_label(candidates[0])}"
+    return None
+
+
+def describe_fixed_layout(
+    node: IDSNode,
+    eligible: set[str],
+    reverse_subtrees: dict[tuple[Any, ...], list[str]],
+) -> str:
+    lines = ["Root structure slot: `NONE` (tree root is a terminal)"]
+    if node.symbol not in STRUCTURE_SET:
+        source = leaf_code_source(node, eligible, reverse_subtrees)
+        lines[0] = "Root mode: `SINGLE`"
+        lines.append(f"Leaf slot L0: {source}" if source else f"Leaf slot L0: NO CODE for `{node.symbol}`")
+        return "\n".join(lines)
+
+    lines[0] = f"Root structure slot: `{node.symbol}` (requires its assigned nonzero 4-bit symbol)"
+    for branch_index in range(3):
+        if branch_index >= len(node.children):
+            lines.append(f"Branch B{branch_index}: `NONE` (unused); its three leaf slots are zero")
+            continue
+
+        branch = node.children[branch_index]
+        lines.append(f"Branch B{branch_index} for IDS child `{branch.symbol}`:")
+        if branch.symbol not in STRUCTURE_SET:
+            source = leaf_code_source(branch, eligible, reverse_subtrees)
+            if source:
+                lines.append(f"  branch structure: `NONE`; leaf L{branch_index}.0: {source}")
+            else:
+                lines.append(
+                    f"  NOT REPRESENTABLE: leaf L{branch_index}.0 needs a 64-bit code for "
+                    f"`{branch.symbol}`, but none is available"
+                )
+            continue
+
+        child_sources = [
+            leaf_code_source(child, eligible, reverse_subtrees) for child in branch.children
+        ]
+        if all(child_sources):
+            lines.append(f"  branch structure slot: `{branch.symbol}`")
+            for leaf_index, source in enumerate(child_sources):
+                lines.append(f"  leaf L{branch_index}.{leaf_index}: {source}")
+            for leaf_index in range(len(child_sources), 3):
+                lines.append(f"  leaf L{branch_index}.{leaf_index}: zero (unused)")
+            continue
+
+        branch_source = leaf_code_source(branch, eligible, reverse_subtrees)
+        if branch_source:
+            lines.append(f"  branch structure: `NONE`; leaf L{branch_index}.0: {branch_source}")
+            continue
+
+        lines.append(
+            f"  NOT REPRESENTABLE: `{branch.symbol}` needs a structure slot here, but one or more "
+            "children cannot be stored as 64-bit leaves and the whole branch has no exact-subtree code"
+        )
+        for leaf_index, (child, source) in enumerate(zip(branch.children, child_sources)):
+            if source:
+                lines.append(f"  required leaf L{branch_index}.{leaf_index}: {source}")
+            elif child.symbol in STRUCTURE_SET:
+                lines.append(
+                    f"  blocked leaf L{branch_index}.{leaf_index}: subtree `"
+                    f"{ids_to_polish(child)}` has no exact registered glyph code; "
+                    "it contains an operator below the allowed depth"
+                )
+            else:
+                lines.append(
+                    f"  blocked leaf L{branch_index}.{leaf_index}: no direct code for "
+                    f"`{child.symbol}`"
+                )
+    return "\n".join(lines)
+
+
+def write_fixed_layout_report(
+    output_path: Path,
+    failures: list[dict[str, Any]],
+    total: int,
+    eligible: set[str],
+    parsed_ids: dict[str, IDSNode],
+    reverse_subtrees: dict[tuple[Any, ...], list[str]],
+) -> None:
+    single_fallbacks = sum(item["character"] in eligible for item in failures)
+    unresolved = sum(not item["resolved"] for item in failures)
+    resolved_without_class_code = sum(
+        item["resolved"] and item["character"] not in eligible for item in failures
+    )
+    lines = [
+        "# Fixed 592-Bit Layout Validation: Non-Fitting Classes",
+        "",
+        f"- Dataset classes: {total}",
+        f"- Strict fixed-layout failures: {len(failures)}",
+        f"- Failures rescuable by whole-class `SINGLE` using the class's own 64-bit code: {single_fallbacks}",
+        f"- Unresolved IDS terminal failures: {unresolved}",
+        f"- Resolved trees with no class-level code and an uncompressible deep subtree: {resolved_without_class_code}",
+        "- Inputs: `dataset/ids_text/ids.txt`, `dataset/ids_text/ids-cdp.txt`, and "
+        "`outputs/261018_cos_median_codebook/all_glyph_codes.pkl` with rendered status from "
+        "`outputs/261007_correct_dict/combined_render_metadata.json`.",
+        "",
+        "## Interpretation",
+        "",
+        "The ordinary tree below is the merged source IDS definition (or a terminal-only placeholder "
+        "when the class has no IDS entry). The effective tree is the result after the existing "
+        "component expansion and exact-subtree replacement pass. The 592-bit view shows the "
+        "root slot, three branch-operator slots, and three 64-bit leaf positions per branch.",
+        "",
+        "A subtree code means an existing rendered glyph code whose IDS tree exactly matches that "
+        "subtree. It does not mean merely that every component has an IDS definition. `SINGLE` "
+        "fallback at the class root discards the internal IDS decomposition and is not counted as "
+        "strict structural fit.",
+        "",
+        "`&CDP-...;` is a CDP component identifier in the IDS data, not a Unicode character glyph "
+        "code. For the unresolved cases listed here, the IDS entry for that identifier is only a "
+        "self-reference and the current rendered 64-bit dictionary has no direct code for it.",
+        "",
+        "The report names structure symbols rather than assigning concrete 4-bit values. The "
+        "symbol-to-bit mapping must reserve `0000` for `NONE` and assign distinct nonzero values "
+        "to all 12 IDS operators and `SINGLE`.",
+        "",
+    ]
+
+    for index, item in enumerate(failures, start=1):
+        character = item["character"]
+        raw_tree = item["raw_tree"]
+        effective = item["effective_tree"]
+        lines.extend(
+            [
+                f"## {index}. {glyph_label(character)}",
+                "",
+                f"- Unicode: `{unicode_key(character)}`",
+                f"- IDS dictionary entry: {'yes' if item['ids_expression'] is not None else 'no'}",
+                f"- Effective terminals resolved to usable 64-bit codes: {'yes' if item['resolved'] else 'no'}",
+                f"- Direct 64-bit code for this whole class: {'yes' if character in eligible else 'no'}",
+                f"- Strict-layout failure: `{item['reason']}`",
+                "",
+                "### Ordinary IDS Tree",
+                "",
+                "```text",
+                render_ids_tree(raw_tree),
+                "```",
+                "",
+                f"IDS prefix form: `{ids_to_polish(raw_tree)}`",
+                "",
+                "### After Component Resolution",
+                "",
+                "```text",
+                render_ids_tree(effective),
+                "```",
+                "",
+                f"Effective prefix form: `{ids_to_polish(effective)}`",
+                "",
+                "### Fixed 592-Bit Layout Tree",
+                "",
+                "```text",
+                describe_fixed_layout(effective, eligible, reverse_subtrees),
+                "```",
+                "",
+            ]
+        )
+
+        missing_terminals: set[str] = set()
+
+        def collect_missing(node: IDSNode) -> None:
+            if node.symbol not in STRUCTURE_SET and node.symbol not in eligible:
+                missing_terminals.add(node.symbol)
+            for child in node.children:
+                collect_missing(child)
+
+        collect_missing(effective)
+        if missing_terminals:
+            lines.extend(["### Unresolved Terminal Details", ""])
+            for token in sorted(missing_terminals):
+                component_tree = parsed_ids.get(token)
+                if component_tree is None:
+                    ids_status = "no IDS entry"
+                elif ids_to_polish(component_tree) == token:
+                    ids_status = "IDS entry exists but is a self-reference, not a decomposition"
+                else:
+                    ids_status = f"IDS entry exists: `{ids_to_polish(component_tree)}`"
+                lines.append(
+                    f"- `{token}`: no usable direct 64-bit code; {ids_status}."
+                )
+            lines.append("")
+
+        if character in eligible:
+            lines.extend(
+                [
+                    "### Optional Whole-Class Fallback",
+                    "",
+                    f"Root mode `SINGLE`, with the class's own 64-bit code for {glyph_label(character)} "
+                    "in the first leaf slot. This represents the class identity but not the IDS tree above.",
+                    "",
+                ]
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     dataset_characters = collect_dataset_characters(Path(args.dataset_root))
@@ -296,6 +522,7 @@ def main() -> None:
     class_fallback_count = 0
     layout_failure_reasons: Counter[str] = Counter()
     layout_failure_samples: list[tuple[str, int, int, int, bool, str]] = []
+    layout_failures: list[dict[str, Any]] = []
 
     for character in sorted(dataset_characters, key=ord):
         tree = parsed_ids.get(character, IDSNode(character))
@@ -340,6 +567,16 @@ def main() -> None:
             if exceeds_leaves:
                 reasons.append("more_than_9_leaves")
             reason = ",".join(reasons)
+            layout_failures.append(
+                {
+                    "character": character,
+                    "ids_expression": ids_entries.get(character),
+                    "raw_tree": tree,
+                    "effective_tree": expanded,
+                    "resolved": resolved,
+                    "reason": reason,
+                }
+            )
             layout_failure_reasons[reason] += 1
             if len(layout_failure_samples) < args.samples:
                 layout_failure_samples.append(
@@ -427,6 +664,12 @@ def main() -> None:
         print("\n--- Samples of Depth 4+ ---")
         for character, expression in samples:
             print(f"[{character}]: {expression}")
+    if args.report_output:
+        report_path = Path(args.report_output)
+        write_fixed_layout_report(
+            report_path, layout_failures, total, eligible, parsed_ids, reverse_subtrees
+        )
+        print(f"Fixed-layout failure report written: {report_path.resolve()}")
 
 
 if __name__ == "__main__":

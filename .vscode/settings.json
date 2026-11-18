@@ -11,6 +11,10 @@
         "/^Get-ChildItem outputs -Recurse -File -Filter '\\*radical\\*code\\*' \\| ForEach-Object \\{ '\\{0\\}`t\\{1\\}`t\\{2:yyyy-MM-dd HH:mm:ss\\}' -f \\$_\\.FullName,\\$_\\.Length,\\$_\\.LastWriteTime \\}$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^c:/Users/kotat/MyPrograms/MyKuzushiji/zero-shot-kuzushiji/\\.venv/Scripts/python\\.exe src/inspect_ids_depth\\.py --samples 0 --report-output outputs/261118_report_fixed_bit_valiation/fixed_592_bit_validation\\.md$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
