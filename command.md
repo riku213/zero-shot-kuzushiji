@@ -767,7 +767,6 @@ python src/12_train_fixed_592_vit.py ^
   --finetune-split-manifest-train "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_train.txt" ^
   --finetune-split-manifest-val "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_validation.txt" ^
   --finetune-split-manifest-test "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_test.txt" ^
-  --build-manifest ^
   --pretrain-epochs 100 ^
   --epochs 100 ^
   --batch-size 32 ^
@@ -783,7 +782,6 @@ python src/12_train_fixed_592_vit.py ^
   --vit-head-lr 0.001 ^
   --vit-weight-decay 0.05 ^
   --early-stopping-patience 10 ^
-  --early-stopping-min-delta 0.002 ^
   --vit-aux-loss ^
   --vit-aux-weight 0.5 ^
   --vit-augmentation ^

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import pickle
 import sys
 from pathlib import Path
@@ -14,13 +14,10 @@ OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "261119_fixed_bit_ViT"
 
 
 def load_vit_training_module() -> Any:
-    spec = importlib.util.spec_from_file_location("fixed_592_vit_training", SRC_DIR / "10_train_model_vit.py")
-    if spec is None or spec.loader is None:
-        raise ImportError("既存ViT学習モジュールを読み込めません。")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    source_dir = str(SRC_DIR)
+    if source_dir not in sys.path:
+        sys.path.insert(0, source_dir)
+    return importlib.import_module("10_train_model_vit")
 
 
 def add_defaults(arguments: list[str]) -> list[str]:
