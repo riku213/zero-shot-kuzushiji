@@ -559,3 +559,245 @@ python src/4_generate_fare.py ^
   --random-state 42 ^
   --metric cosine
 '''
+
+[26/10/19] ViTによる学習．codebookはumap-cosによる2値化部首を使っている．2値化の閾値にはデータの中央値を使っている．
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261019_ViT_umap_cos/final_codebook_1212.pkl" ^
+  --output-dir "outputs/261019_ViT_umap_cos/training" ^
+  --checkpoint-path "outputs/261019_ViT_umap_cos/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261019_ViT_umap_cos/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261019_ViT_umap_cos/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261019_ViT_umap_cos/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261019_ViT_umap_cos/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261019_ViT_umap_cos/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261019_ViT_umap_cos/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261019_ViT_umap_cos/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261019_ViT_umap_cos/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261019_ViT_umap_cos/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261019_ViT_umap_cos/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261019_ViT_umap_cos/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261019_ViT_umap_cos/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --pretrain-epochs 20 ^
+  --epochs 20 ^
+  --batch-size 32 ^
+  --device cuda ^
+  --num-workers 4 ^
+  --log-path "outputs/261019_ViT_umap_cos/training/train.log"
+```
+
+[26/10/25]ViTを400次元のコード出力で学習，未知データひらがなカタカナを削除．補助損失を追加，学習データに対するオーグメンテーション，Early Stopping 
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --output-dir "outputs/261024_ViT_code400/training" ^
+  --checkpoint-path "outputs/261024_ViT_code400/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261024_ViT_code400/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261024_ViT_code400/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261024_ViT_code400/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261024_ViT_code400/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261024_ViT_code400/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261024_ViT_code400/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261024_ViT_code400/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261024_ViT_code400/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261024_ViT_code400/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261024_ViT_code400/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261024_ViT_code400/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261024_ViT_code400/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --early-stopping-patience 10 ^
+  --early-stopping-min-delta 0.01 ^
+  --vit-aux-loss ^
+  --vit-aux-weight 0.5 ^
+  --vit-augmentation ^
+  --log-path "outputs/261024_ViT_code400/training/train.log"
+```
+
+
+[26/10/27] 補助損失が過剰に爆発．tanhとclamp?で抑制．
+```
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-manifest-path "outputs/261007_correct_dict/training/casia_train_manifest.txt" ^
+  --pretrain-test-manifest-path "outputs/261007_correct_dict/training/casia_test_manifest.txt" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --output-dir "outputs/261027_ViT_code400_v2/training" ^
+  --checkpoint-path "outputs/261027_ViT_code400_v2/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261027_ViT_code400_v2/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261027_ViT_code400_v2/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261027_ViT_code400_v2/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261027_ViT_code400_v2/training/run_metadata.json" ^
+  --pretrain-split-manifest-train "outputs/261027_ViT_code400_v2/training/pretrain_train_manifest.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261027_ViT_code400_v2/training/pretrain_val_seen_manifest.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261027_ViT_code400_v2/training/pretrain_val_unseen_manifest.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261027_ViT_code400_v2/training/pretrain_test_seen_manifest.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261027_ViT_code400_v2/training/pretrain_test_unseen_manifest.txt" ^
+  --finetune-split-manifest-train "outputs/261027_ViT_code400_v2/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261027_ViT_code400_v2/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261027_ViT_code400_v2/training/finetune_test_manifest.txt" ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --log-path "outputs/261027_ViT_code400_v2/training/train.log"
+```
+[26/11/2] 既知ではなく未知クラスの指標による評価、未知クラスの検証テスト分割、ZSLによる評価指標追加、CEの選択肢を既知クラスに限定、GZSLのcalibrated stacking実装
+```
+conda activate kuzushiji
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --init-from "outputs/261027_ViT_code400_v2/training/pretrain_best_fare_model.pth" ^
+  --output-dir "outputs/261102_stage1_ft/training" ^
+  --checkpoint-path "outputs/261102_stage1_ft/training/best_fare_model.pth" ^
+  --state-path "outputs/261102_stage1_ft/training/training_state.pth" ^
+  --metadata-path "outputs/261102_stage1_ft/training/run_metadata.json" ^
+  --finetune-split-manifest-train "outputs/261102_stage1_ft/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261102_stage1_ft/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261102_stage1_ft/training/finetune_test_manifest.txt" ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --log-path "outputs/261102_stage1_ft/training/train.log"
+```
+
+[26/11/2] 出力ヘッドを木構造のノード数分用意，各パーツの他クラス分類タスクとして学習．
+```
+conda activate kuzushiji
+python src/10_train_model_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --manifest-path "outputs/manifests/main_manifest.txt" ^
+  --codebook "outputs/261024_ViT_code400/final_codebook_400.pkl" ^
+  --init-from "outputs/261027_ViT_code400_v2/training/pretrain_best_fare_model.pth" ^
+  --output-dir "outputs/261102_stage2_ft/training" ^
+  --checkpoint-path "outputs/261102_stage2_ft/training/best_fare_model.pth" ^
+  --state-path "outputs/261102_stage2_ft/training/training_state.pth" ^
+  --metadata-path "outputs/261102_stage2_ft/training/run_metadata.json" ^
+  --finetune-split-manifest-train "outputs/261102_stage2_ft/training/finetune_train_manifest.txt" ^
+  --finetune-split-manifest-val "outputs/261102_stage2_ft/training/finetune_validation_manifest.txt" ^
+  --finetune-split-manifest-test "outputs/261102_stage2_ft/training/finetune_test_manifest.txt" ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --device cuda ^
+  --batch-size 32 ^
+  --num-workers 4 ^
+  --log-path "outputs/261102_stage2_ft/training/train.log"
+```
+
+[26/11/19] 固定592-bit木構造codebookを用いたViT-B/16学習。codebookは4-bit root、3個の4-bit branch、各branchの3個の64-bit glyph leafで構成する。`NONE=0000`、`SINGLE=0001`、既存IDS記号順の12演算子を`0010`から順に割り当てる。0/1はモデルのFaRE表現に合わせて-1/+1へ変換する。構造記号ビットは常に有効、未使用leafは値0かつmask無効とし、現行のmasked dot product・CrossEntropy・補助BCEを利用する。
+
+くずし字4328クラスのうち、厳密な固定レイアウトに適合しない41クラスは、`SINGLE`での救済を含めてcodebookから除外する。学習データを集める段階でcodebookにないクラスは対象にならないため、これらはtrain/validation/testのすべてから除かれる。クラス和集合manifestにあるCASIA専用クラスは、同じ固定レイアウトで表現できる場合に追加する。IDS定義がない文字は、直接の64-bit glyph codeがある場合に`SINGLE`として表現する。CASIAを含む学習全体は、ImageNet事前学習済みViT-B/16から新規に開始し、別実験のcheckpointは読み込まない。CASIA公式Train内のseen/unseen分割で事前学習した後、くずし字のseen/unseen分割でファインチューニングする。未知クラスのvalidation/test分離、component head、component loss、auxiliary BCE、calibrated stackingなど、直近ViT実験の設定を維持する。
+
+最初に固定592-bit codebookを作成する。クラス和集合manifestは、くずし字とCASIAのラベル対応を含む`261007_correct_dict`の監査済みmanifestを使う。pickleが学習用codebook、JSON companionと`codebook_exclusions.json`が仕様・除外理由の確認用である。
+
+```bat
+conda activate kuzushiji
+python src/11_build_fixed_592_codebook.py ^
+  --ids-files "dataset/ids_text/ids.txt" "dataset/ids_text/ids-cdp.txt" ^
+  --dataset-root "../kuzushiji-recognition/char_sep_datas" ^
+  --class-union-manifest "outputs/261007_correct_dict/class_union_audit.json" ^
+  --radical-codes "outputs/261018_cos_median_codebook/all_glyph_codes.pkl" ^
+  --render-metadata "outputs/261007_correct_dict/combined_render_metadata.json" ^
+  --image-root "outputs/261007_correct_dict" ^
+  --max-depth 6 ^
+  --output "outputs/261119_fixed_bit_ViT/fixed_592_codebook.pkl"
+```
+
+codebook作成完了時、くずし字クラスの収録数が4287、固定レイアウト不適合による除外数が41であることを確認する。CASIA専用クラスはIDS・glyph codeの解決状況により追加収録できない場合もあるため、出力ログと`fixed_592_codebook.json`の収録数を確認する。
+
+続けてCASIA事前学習とくずし字ファインチューニングを実行する。manifest、checkpoint、resume state、metadata、ログはすべて`outputs/261119_fixed_bit_ViT/`以下に保存する。`--init-from`は指定しない。これによりImageNet重みで初期化し、CASIA公式Trainの学習後にくずし字データで学習する。以下はCMDで実行するコマンド例である。
+
+```bat
+conda activate kuzushiji
+python src/12_train_fixed_592_vit.py ^
+  --data-root "../kuzushiji-recognition/char_sep_datas" ^
+  --codebook "outputs/261119_fixed_bit_ViT/fixed_592_codebook.pkl" ^
+  --output-dir "outputs/261119_fixed_bit_ViT/training" ^
+  --checkpoint-path "outputs/261119_fixed_bit_ViT/training/best_fare_model.pth" ^
+  --pretrain-checkpoint-path "outputs/261119_fixed_bit_ViT/training/pretrain_best_fare_model.pth" ^
+  --state-path "outputs/261119_fixed_bit_ViT/training/training_state.pth" ^
+  --pretrain-state-path "outputs/261119_fixed_bit_ViT/training/pretrain_training_state.pth" ^
+  --metadata-path "outputs/261119_fixed_bit_ViT/training/run_metadata.json" ^
+  --manifest-path "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_images.txt" ^
+  --pretrain-root "../kuzushiji-recognition/CASIA-HWDB" ^
+  --pretrain-manifest-path "outputs/261119_fixed_bit_ViT/manifests/casia_train_images.txt" ^
+  --pretrain-test-manifest-path "outputs/261119_fixed_bit_ViT/manifests/casia_test_images.txt" ^
+  --pretrain-label-map "outputs/261007_correct_dict/class_union_audit.json" ^
+  --pretrain-split-manifest-train "outputs/261119_fixed_bit_ViT/manifests/casia_train.txt" ^
+  --pretrain-split-manifest-seen-test "outputs/261119_fixed_bit_ViT/manifests/casia_test_seen.txt" ^
+  --pretrain-split-manifest-unseen-test "outputs/261119_fixed_bit_ViT/manifests/casia_test_unseen.txt" ^
+  --pretrain-split-manifest-val-seen "outputs/261119_fixed_bit_ViT/manifests/casia_val_seen.txt" ^
+  --pretrain-split-manifest-val-unseen "outputs/261119_fixed_bit_ViT/manifests/casia_val_unseen.txt" ^
+  --finetune-split-manifest-train "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_train.txt" ^
+  --finetune-split-manifest-val "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_validation.txt" ^
+  --finetune-split-manifest-test "outputs/261119_fixed_bit_ViT/manifests/kuzushiji_test.txt" ^
+  --pretrain-epochs 100 ^
+  --epochs 100 ^
+  --batch-size 32 ^
+  --pretrain-train-class-ratio 0.8 ^
+  --pretrain-seen-train-ratio 0.8 ^
+  --finetune-train-class-ratio 0.8 ^
+  --train-ratio 0.8 ^
+  --validation-sample-ratio 0.5 ^
+  --seed 42 ^
+  --device cuda ^
+  --num-workers 4 ^
+  --vit-lr 0.00005 ^
+  --vit-head-lr 0.001 ^
+  --vit-weight-decay 0.05 ^
+  --early-stopping-patience 10 ^
+  --vit-aux-loss ^
+  --vit-aux-weight 0.5 ^
+  --vit-augmentation ^
+  --vit-logit-bound 5.0 ^
+  --vit-warmup-steps 3000 ^
+  --lr-scheduler-patience 5 ^
+  --monitor val_h ^
+  --ce-train-classes-only ^
+  --kana-max-samples-per-class 300 ^
+  --val-max-samples 20000 ^
+  --disjoint-unseen ^
+  --component-head ^
+  --component-loss-weight 1.0 ^
+  --component-min-count 1 ^
+  --component-unknown-logp -9.0 ^
+  --log-path "outputs/261119_fixed_bit_ViT/training/train.log"
+```
+
+途中再開は同じコマンドを再実行する。`--state-path`と`--pretrain-state-path`は実験専用の同じパスを維持する。codebookを変更した場合は既存stateを再利用せず、新しい実験出力先を使う。
