@@ -60,6 +60,7 @@ LAMBDA_GRID = (0.0, 1.0, 2.0, 4.0, 8.0)
 MONITORS = {"val_h": ("max", 0.002), "val_unseen_zsl_acc": ("max", 0.002), "val_seen_loss": ("min", 0.01)}
 # Shared between the training function and the patched test evaluation.
 STATE: dict[str, Any] = {"seen_mask": None, "gamma": 0.0, "lambda": 0.0, "stage": "", "out_dir": None, "components": None}
+PRETRAIN_COMPONENT_VOCAB: list[str] | None = None
 
 
 def is_kana_label(label: str) -> bool:
@@ -210,6 +211,7 @@ class ViTFareRecognitionModel(nn.Module):
         self.backbone.heads = nn.Identity()
         self.projection = nn.Linear(768, codebook_dim)
         self.component_head: nn.Linear | None = None  # attached once the training-set vocabulary is known
+        self.component_vocabulary: list[str] | None = None
         self.logit_bound = float(SETTINGS.logit_bound)
 
     def load_state_dict(self, state_dict: Any, strict: bool = True, **kwargs: Any) -> Any:
@@ -258,8 +260,43 @@ def make_model(codebook_dim: int = 400, **_: Any) -> nn.Module:
     if SETTINGS.init_from:
         checkpoint = torch.load(SETTINGS.init_from, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["state_dict"])
+        vocabulary = checkpoint.get("component_vocabulary")
+        model.component_vocabulary = list(vocabulary) if vocabulary is not None else None
         print(f"Initialized model from {SETTINGS.init_from} (epoch {checkpoint.get('epoch')}).")
     return model
+
+
+def transfer_component_head(
+    source_head: nn.Linear | None,
+    source_vocabulary: list[str] | None,
+    target_vocabulary: list[str],
+    input_dim: int = 768,
+    device: torch.device | None = None,
+) -> tuple[nn.Linear, int]:
+    """Build a target-vocabulary head and copy rows for tokens shared by name."""
+    if source_head is not None:
+        device = source_head.weight.device
+        dtype = source_head.weight.dtype
+        input_dim = source_head.in_features
+    else:
+        dtype = torch.float32
+        device = device or torch.device("cpu")
+
+    target_head = nn.Linear(input_dim, len(target_vocabulary), device=device, dtype=dtype)
+    if source_head is None or source_vocabulary is None:
+        return target_head, 0
+
+    source_positions = {token: index for index, token in enumerate(source_vocabulary)}
+    copied = 0
+    with torch.no_grad():
+        for target_index, token in enumerate(target_vocabulary):
+            source_index = source_positions.get(token)
+            if source_index is None:
+                continue
+            target_head.weight[target_index].copy_(source_head.weight[source_index])
+            target_head.bias[target_index].copy_(source_head.bias[source_index])
+            copied += 1
+    return target_head, copied
 
 
 @torch.no_grad()
@@ -485,6 +522,8 @@ def train_vit_on_dataset(
     structured_codebook: bool = False,
     verbose: bool = True,
 ) -> tuple[float, float]:
+    global PRETRAIN_COMPONENT_VOCAB
+
     workers = SETTINGS.num_workers
     loader_options = {
         "num_workers": workers,
@@ -514,11 +553,15 @@ def train_vit_on_dataset(
     num_classes = codebook_matrix.shape[0]
     train_mask = torch.zeros(num_classes, dtype=torch.bool, device=device)
     train_mask[sorted({int(entry["label"]) for entry in train_entries})] = True
+    stage = "pretrain" if checkpoint_path.name.startswith("pretrain") else "finetune"
+    source_vocabulary = model.component_vocabulary
+    if source_vocabulary is None and stage == "finetune":
+        source_vocabulary = PRETRAIN_COMPONENT_VOCAB
     STATE.update(
         seen_mask=train_mask,
         gamma=0.0,
         **{"lambda": 0.0},
-        stage="pretrain" if checkpoint_path.name.startswith("pretrain") else "finetune",
+        stage=stage,
         out_dir=checkpoint_path.parent,
         components=None,
     )
@@ -526,8 +569,21 @@ def train_vit_on_dataset(
         components = build_component_assets(class_to_index, {int(entry["label"]) for entry in train_entries}, device)
         if components is not None:
             STATE["components"] = components
-            if model.component_head is None:
-                model.component_head = nn.Linear(768, len(components["vocabulary"])).to(device)
+            target_vocabulary = components["vocabulary"]
+            model.component_head, copied_rows = transfer_component_head(
+                model.component_head,
+                source_vocabulary,
+                target_vocabulary,
+                device=device,
+            )
+            model.component_vocabulary = list(target_vocabulary)
+            if stage == "pretrain":
+                PRETRAIN_COMPONENT_VOCAB = list(target_vocabulary)
+            if verbose:
+                print(
+                    f"Component head aligned to {len(target_vocabulary)} components; "
+                    f"transferred {copied_rows} rows by component name."
+                )
     history_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_history.jsonl")
     monitor_mode, default_delta = MONITORS[SETTINGS.monitor]
     min_delta = default_delta if SETTINGS.min_delta is None else SETTINGS.min_delta
@@ -645,6 +701,11 @@ def train_vit_on_dataset(
             component_logits = model.project_components(features)
             if component_logits is not None:
                 component_targets = STATE["components"]["targets"].index_select(0, labels)
+                if component_logits.shape != component_targets.shape:
+                    raise RuntimeError(
+                        "Component head/target shape mismatch: "
+                        f"logits={tuple(component_logits.shape)}, targets={tuple(component_targets.shape)}."
+                    )
                 positives = component_targets.sum(dim=1)
                 has_positive = positives > 0
                 per_sample = -(F.log_softmax(component_logits, dim=1) * component_targets).sum(dim=1) / positives.clamp_min(1)

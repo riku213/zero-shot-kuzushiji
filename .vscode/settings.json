@@ -15,6 +15,10 @@
         "/^c:/Users/kotat/MyPrograms/MyKuzushiji/zero-shot-kuzushiji/\\.venv/Scripts/python\\.exe src/inspect_ids_depth\\.py --samples 0 --report-output outputs/261118_report_fixed_bit_valiation/fixed_592_bit_validation\\.md$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^C:/Users/kotat/AppData/Local/anaconda3/envs/kuzushiji/python\\.exe -m unittest tests\\.test_vit_component_transfer -v$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
