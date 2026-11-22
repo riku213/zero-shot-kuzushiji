@@ -4,3 +4,4 @@ torch
 torchvision
 umap-learn
 fonttools
+matplotlib
