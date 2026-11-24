@@ -93,7 +93,12 @@ def main() -> None:
         metadata = dict(payload)
         vit_settings = dict(metadata.get("vit_settings", {}))
         vit_settings["output_code_bits"] = 592
-        vit_settings["initialization"] = "ImageNet ViT-B/16 weights; no experiment checkpoint"
+        vit_settings["initialization"] = (
+            "CASIA pretraining: ImageNet ViT-B/16 weights; Kuzushiji fine-tuning: "
+            "best CASIA pretraining checkpoint, with shared component rows transferred by token name"
+            if metadata.get("pretrain_root")
+            else "ImageNet ViT-B/16 weights; no experiment checkpoint"
+        )
         vit_settings["fixed_codebook_format"] = "fixed-592-tree-v1"
         vit_settings["excluded_kuzushiji_classes"] = 41
         metadata["vit_settings"] = vit_settings
