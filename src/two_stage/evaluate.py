@@ -142,7 +142,9 @@ def load_stage2_checkpoint(path: Path, device: torch.device):
         component_vocabulary_size=len(vocabularies["component_vocab"]),
         max_skeleton_length=int(model_config["max_skeleton_length"]),
         pad_id=int(model_config["pad_id"]),
-        image_size=int(model_config["image_size"]),
+        image_size=int(
+            model_config.get("image_size", checkpoint["experiment_config"]["data"]["image_size"])
+        ),
         patch_size=int(model_config["patch_size"]),
         d_model=int(model_config["d_model"]),
         encoder_layers=int(model_config["encoder_layers"]),

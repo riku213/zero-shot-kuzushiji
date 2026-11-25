@@ -4,6 +4,11 @@ __pycache__/
 env/
 dataset/*
 outputs/*
+wandb/
 tmp_test_check/
 AGENTS.md
-docs/
+docs/*
+!docs/experiment-history.md
+!docs/experiment-results/
+docs/experiment-results/*
+!docs/experiment-results/261125-two-stage-m3-baseline.md

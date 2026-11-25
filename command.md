@@ -801,3 +801,23 @@ python src/12_train_fixed_592_vit.py ^
 ```
 
 途中再開は同じコマンドを再実行する。`--state-path`と`--pretrain-state-path`は実験専用の同じパスを維持する。codebookを変更した場合は既存stateを再利用せず、新しい実験出力先を使う。
+
+[26/11/25] Stage 1スケルトン分類 + Stage 2 filled_marker oracle基準実験
+
+標準設定は256クラス上限、1クラス最大16画像、seed 42、画像128x128、ランダムなクラス内画像分割（train/validation/test = 0.8/0.1/残り）。Stage 1 CNNとStage 2 ViTは別々に5 epoch学習する。Stage 2は正解スケルトンを入力する`filled_marker` oracle条件、leaf-set 10,016部品の分類で、ImageNet事前学習・glyph code・補助損失は使わない。W&Bはログイン済み設定を使い、APIキーはconfigやコードへ保存しない。
+
+小規模ランは`configs/two_stage_m3_smoke.yaml`（12クラス、最大10画像/クラス、各stage 1 epoch）を使う。成功run URLはStage 1 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/zsmck86b`、Stage 2 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/z0hacj7w`、評価 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/37uqm7t8`。結果YAMLは`outputs/261125_two_stage_m3_smoke/result_two-stage-m3-smoke-261125.yaml`。
+
+標準configによる本ランはStage 1 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/l02kwyq7`、Stage 2 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/l24spwpl`、評価 `https://forge.coreweave.com/wandb/rikuo213-hosei-university/zero-shot-kuzushiji/runs/gk8yb860`。評価結果と指標の深さ別内訳は`outputs/two_stage_baseline/evaluation.json`、labnote YAML v2は`outputs/two_stage_baseline/result_two-stage-261125.yaml`、詳細は`docs/experiment-results/261125-two-stage-m3-baseline.md`を参照する。
+
+実行例（Windows、リポジトリrootから。環境依存の全設定値は指定configに固定済み）：
+
+```bat
+conda activate kuzushiji
+python -m src.two_stage.train_stage1 --config configs/two_stage_m3_smoke.yaml
+python -m src.two_stage.train_stage2 --config configs/two_stage_m3_smoke.yaml
+python -m src.two_stage.evaluate --config configs/two_stage_m3_smoke.yaml
+python -m src.two_stage.train_stage1 --config configs/two_stage_default.yaml
+python -m src.two_stage.train_stage2 --config configs/two_stage_default.yaml
+python -m src.two_stage.evaluate --config configs/two_stage_default.yaml
+```

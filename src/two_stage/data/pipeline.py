@@ -102,7 +102,7 @@ def resolve_effective_tree(
                     reverse_subtrees,
                     ancestors | {node.symbol},
                 )
-        return IDSNode(replacement[0]), True if replacement else False
+        return (IDSNode(replacement[0]), True) if replacement else (IDSNode(node.symbol), False)
 
     if depth >= max_depth:
         return (IDSNode(replacement[0]), True) if replacement else (node, False)
@@ -306,7 +306,11 @@ class SlotInstanceDataset(Dataset[dict[str, Any]]):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         instance = self.instances[index]
-        return {**instance, "image": image_to_tensor(instance["image_path"], self.image_size)}
+        return {
+            **instance,
+            "input_ids": torch.tensor(instance["input_ids"], dtype=torch.long),
+            "image": image_to_tensor(instance["image_path"], self.image_size),
+        }
 
 
 def _operator_depth(node: IDSNode) -> int:

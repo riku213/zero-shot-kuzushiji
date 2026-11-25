@@ -13,10 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from src.two_stage.data.pipeline import (
     ImageRecordDataset,
     expand_filled_marker_instances,
+    resolve_effective_tree,
     split_records,
 )
 from src.two_stage.evaluate import build_labnote_payload, evaluate_oracle
 from src.two_stage.experiment import skeleton_vocabulary, stage2_vocabularies
+from src.two_stage.experiment import slot_loader
 from src.structured_codebook import STRUCTURE_SYMBOLS
 from src.two_stage.models.stage1_classifier import Stage1SkeletonClassifier
 from src.two_stage.models.stage2_filler import Stage2SlotFiller, slot_only_cross_entropy
@@ -81,6 +83,49 @@ class TwoStageBaselineTests(unittest.TestCase):
         self.assertEqual(first_input["<PAD>"], 0)
         self.assertTrue(set(STRUCTURE_SYMBOLS).issubset(first_input))
         self.assertEqual(first_components, second_components)
+
+    def test_stage2_loader_batches_input_ids_as_tensor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "sample.png"
+            Image.new("RGB", (32, 32), color="white").save(image_path)
+            record = {
+                "image_path": str(image_path),
+                "char": "明",
+                "depth": 1,
+                "skeleton": ["⿰", "□", "□"],
+                "components": ["日", "月"],
+            }
+            loader = slot_loader(
+                [record],
+                {"<PAD>": 0, "□": 1, "<FILLED>": 2, "⿰": 3},
+                {"日": 0, "月": 1},
+                image_size=32,
+                batch_size=2,
+                workers=0,
+                shuffle=False,
+                max_skeleton_length=3,
+            )
+
+            batch = next(iter(loader))
+
+            self.assertIsInstance(batch["input_ids"], torch.Tensor)
+            self.assertEqual(batch["input_ids"].shape, (2, 3))
+
+    def test_depth_limited_unresolved_leaf_is_returned_without_indexing_missing_fallback(self) -> None:
+        node = IDSNode("木")
+
+        effective, resolved = resolve_effective_tree(
+            node,
+            depth=1,
+            max_depth=1,
+            eligible=set(),
+            parsed_ids={},
+            reverse_subtrees={},
+        )
+
+        self.assertEqual(effective.symbol, node.symbol)
+        self.assertEqual(effective.children, node.children)
+        self.assertFalse(resolved)
 
     def test_split_is_deterministic_and_keeps_each_class_in_training(self) -> None:
         records = [

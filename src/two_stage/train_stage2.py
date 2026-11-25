@@ -107,7 +107,13 @@ def main() -> None:
     run = start_wandb(config, "stage2-oracle-filled-marker")
     best_loss = float("inf")
     model_config = dict(stage_config)
-    model_config.update({"max_skeleton_length": max_skeleton_length, "pad_id": pad_id})
+    model_config.update(
+        {
+            "image_size": int(data_config["image_size"]),
+            "max_skeleton_length": max_skeleton_length,
+            "pad_id": pad_id,
+        }
+    )
     vocabularies = {"input_vocab": input_vocab, "component_vocab": component_vocab}
     try:
         run.log(
