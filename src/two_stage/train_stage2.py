@@ -30,11 +30,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run_epoch(model, data_loader, optimizer, device: torch.device) -> float:
+def _run_epoch(model, data_loader, optimizer, device: torch.device) -> tuple[float, float, float]:
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     total = 0
+    total_correct = 0
+    image_correct: dict[str, list[int]] = {}
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for batch in tqdm(data_loader, desc="train" if training else "validation", leave=False):
@@ -44,13 +46,25 @@ def _run_epoch(model, data_loader, optimizer, device: torch.device) -> float:
             targets = batch["target_id"].to(device)
             logits = model(images, input_ids)
             loss = slot_only_cross_entropy(logits, positions, targets)
+            predictions = logits[torch.arange(logits.shape[0], device=device), positions].argmax(dim=-1)
+            correct = predictions.eq(targets)
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
             total_loss += float(loss.detach()) * targets.numel()
             total += targets.numel()
-    return total_loss / max(1, total)
+            total_correct += int(correct.sum())
+            for image_path, is_correct in zip(batch["image_path"], correct.tolist()):
+                counts = image_correct.setdefault(image_path, [0, 0])
+                counts[0] += int(is_correct)
+                counts[1] += 1
+    exact_matches = sum(correct == count for correct, count in image_correct.values())
+    return (
+        total_loss / max(1, total),
+        total_correct / max(1, total),
+        exact_matches / max(1, len(image_correct)),
+    )
 
 
 def main() -> None:
@@ -100,12 +114,15 @@ def main() -> None:
         splits["validation"], input_vocab, component_vocab, int(data_config["image_size"]),
         int(stage_config["batch_size"]), int(data_config["num_workers"]), False, max_skeleton_length,
     )
-    output_dir = Path(config["experiment"]["output_dir"]) / "stage2"
-    if not output_dir.is_absolute():
-        output_dir = Path.cwd() / output_dir
+    output_dir = resolve_path(config["experiment"]["output_dir"]) / "stage2"
     output_dir.mkdir(parents=True, exist_ok=True)
     run = start_wandb(config, "stage2-oracle-filled-marker")
     best_loss = float("inf")
+    best_accuracy = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
+    patience = int(stage_config.get("early_stopping_patience", stage_config["epochs"]))
+    min_delta = float(stage_config.get("early_stopping_min_delta", 0.0))
     model_config = dict(stage_config)
     model_config.update(
         {
@@ -129,21 +146,44 @@ def main() -> None:
             }
         )
         for epoch in range(1, int(stage_config["epochs"]) + 1):
-            train_loss = _run_epoch(model, train_loader, optimizer, device)
-            validation_loss = _run_epoch(model, validation_loader, None, device)
+            train_loss, train_accuracy, train_exact = _run_epoch(model, train_loader, optimizer, device)
+            validation_loss, validation_accuracy, validation_exact = _run_epoch(
+                model, validation_loader, None, device
+            )
             metrics = {
                 "epoch": epoch,
                 "stage2/train_loss": train_loss,
+                "stage2/train_slot_accuracy": train_accuracy,
+                "stage2/train_slot_exact_match": train_exact,
                 "stage2/validation_loss": validation_loss,
+                "stage2/validation_slot_accuracy": validation_accuracy,
+                "stage2/validation_slot_exact_match": validation_exact,
             }
             run.log(metrics, step=epoch)
             print(metrics)
-            if validation_loss < best_loss:
+            if validation_accuracy > best_accuracy + min_delta:
+                best_accuracy = validation_accuracy
                 best_loss = validation_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 save_checkpoint(
                     output_dir / "best.pt", model, optimizer, epoch, model_config, vocabularies, config
                 )
-        run.log({"stage2/best_validation_loss": best_loss})
+            else:
+                epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print({"stage2/early_stopping_epoch": epoch, "stage2/best_epoch": best_epoch})
+                break
+        checkpoint = torch.load(output_dir / "best.pt", map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        run.log(
+            {
+                "stage2/best_validation_loss": best_loss,
+                "stage2/best_validation_slot_accuracy": best_accuracy,
+                "stage2/best_epoch": best_epoch,
+                "stage2/stopped_epoch": epoch,
+            }
+        )
         import wandb
 
         artifact = wandb.Artifact("stage2-oracle-filled-marker", type="model")

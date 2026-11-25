@@ -205,7 +205,7 @@ def evaluate_stage1_checkpoint(path: Path, records: list[dict[str, Any]], image_
     }
 
 
-def _flatten_labnote_metrics(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+def _flatten_labnote_metrics(metrics: dict[str, Any], split_name: str = "random") -> list[dict[str, Any]]:
     flat: list[dict[str, Any]] = []
     if "stage1" in metrics:
         flat.append(
@@ -218,7 +218,7 @@ def _flatten_labnote_metrics(metrics: dict[str, Any]) -> list[dict[str, Any]]:
         for depth_name, packed in metrics["stage1"]["by_depth"].items():
             flat.append(
                 {
-                    "key": f"random.{depth_name}.stage1.skeleton_accuracy",
+                    "key": f"{split_name}.{depth_name}.stage1.skeleton_accuracy",
                     "value": round(float(packed["stage1.skeleton_accuracy"]), 2),
                     "unit": "%",
                 }
@@ -229,7 +229,7 @@ def _flatten_labnote_metrics(metrics: dict[str, Any]) -> list[dict[str, Any]]:
         for key in STAGE2_METRIC_KEYS:
             flat.append(
                 {
-                    "key": f"random.{depth_name}.{key}",
+                    "key": f"{split_name}.{depth_name}.{key}",
                     "value": round(float(packed[key]), 2),
                     "unit": "%",
                 }
@@ -280,14 +280,20 @@ def build_labnote_payload(
         "params": {
             "stage1_epochs": config["stage1"]["epochs"],
             "stage1_learning_rate": config["stage1"]["learning_rate"],
+            "stage1_early_stopping_patience": config["stage1"].get(
+                "early_stopping_patience", config["stage1"]["epochs"]
+            ),
             "stage2_epochs": stage_config["epochs"],
             "stage2_learning_rate": stage_config["learning_rate"],
+            "stage2_early_stopping_patience": stage_config.get(
+                "early_stopping_patience", stage_config["epochs"]
+            ),
             "d_model": stage_config["d_model"],
             "encoder_layers": stage_config["encoder_layers"],
             "decoder_layers": stage_config["decoder_layers"],
             "patch_size": stage_config["patch_size"],
         },
-        "metrics": _flatten_labnote_metrics(metrics),
+        "metrics": _flatten_labnote_metrics(metrics, str(experiment_config["split"])),
     }
     serialized = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
     round_trip = yaml.safe_load(serialized)
@@ -303,7 +309,7 @@ def main() -> None:
     splits, reverse_index, data_summary = prepare_data(config)
     output_dir = Path(config["experiment"]["output_dir"])
     if not output_dir.is_absolute():
-        output_dir = Path.cwd() / output_dir
+        output_dir = Path(__file__).resolve().parents[2] / output_dir
     checkpoint_path = args.stage2_checkpoint or output_dir / "stage2" / "best.pt"
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Stage 2 checkpoint not found: {checkpoint_path}")
@@ -329,23 +335,33 @@ def main() -> None:
     yaml_path = args.output or config["tracking"].get("result_yaml")
     yaml_path = Path(yaml_path) if yaml_path else output_dir / f"result_{experiment_id}.yaml"
     if not yaml_path.is_absolute():
-        yaml_path = Path.cwd() / yaml_path
+        yaml_path = Path(__file__).resolve().parents[2] / yaml_path
     payload = build_labnote_payload(config, metrics, experiment_id, checkpoint_path, data_summary)
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
     yaml_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
     write_json(output_dir / "evaluation.json", {"metrics": metrics, "data": data_summary, "rows": rows})
+    write_json(output_dir / "summary.json", {"git": git_metadata(), "data": data_summary, "metrics": metrics})
 
     run = start_wandb(config, "two-stage-oracle-evaluation")
     try:
-        flattened = {f"oracle/{key}": value for key, value in metrics["overall"].items() if isinstance(value, (int, float))}
+        split_name = str(config["experiment"]["split"])
+        flattened = {
+            f"{split_name}/oracle/{key}": value
+            for key, value in metrics["overall"].items()
+            if isinstance(value, (int, float))
+        }
         for depth_name, packed in metrics["by_depth"].items():
             flattened.update(
-                {f"oracle/{depth_name}/{key}": value for key, value in packed.items() if isinstance(value, (int, float))}
+                {
+                    f"{split_name}/oracle/{depth_name}/{key}": value
+                    for key, value in packed.items()
+                    if isinstance(value, (int, float))
+                }
             )
         if "stage1" in metrics:
-            flattened["stage1/skeleton_accuracy"] = metrics["stage1"]["stage1.skeleton_accuracy"]
+            flattened[f"{split_name}/stage1/skeleton_accuracy"] = metrics["stage1"]["stage1.skeleton_accuracy"]
             for depth_name, packed in metrics["stage1"]["by_depth"].items():
-                flattened[f"stage1/{depth_name}/skeleton_accuracy"] = packed["stage1.skeleton_accuracy"]
+                flattened[f"{split_name}/stage1/{depth_name}/skeleton_accuracy"] = packed["stage1.skeleton_accuracy"]
         run.log(flattened)
         import wandb
 

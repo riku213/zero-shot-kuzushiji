@@ -4,6 +4,9 @@ __pycache__/
 env/
 dataset/*
 outputs/*
+!outputs/261125_two_stage_m3_full/
+outputs/261125_two_stage_m3_full/*
+!outputs/261125_two_stage_m3_full/command.md
 wandb/
 tmp_test_check/
 AGENTS.md

@@ -74,6 +74,7 @@ def prepare_data(config: dict[str, Any]) -> tuple[dict[str, list[dict[str, Any]]
         float(experiment_config["train_ratio"]),
         float(experiment_config["validation_ratio"]),
         int(experiment_config["seed"]),
+        str(experiment_config.get("split", "random")),
     )
     summary["split_samples"] = {key: len(value) for key, value in splits.items()}
     summary["split_classes"] = {
@@ -169,11 +170,13 @@ def start_wandb(config: dict[str, Any], run_name: str):
 
     tracking = config["tracking"]
     mode = os.environ.get("WANDB_MODE", tracking.get("wandb_mode", "online"))
+    wandb_dir = tracking.get("wandb_dir")
     return wandb.init(
         project=tracking.get("wandb_project", "zero-shot-kuzushiji"),
         entity=tracking.get("wandb_entity"),
         mode=mode,
         name=run_name,
+        dir=str(resolve_path(wandb_dir)) if wandb_dir else None,
         config={"experiment_config": config, "git": git_metadata()},
         reinit=True,
     )

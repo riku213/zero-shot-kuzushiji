@@ -14,6 +14,7 @@ from src.two_stage.experiment import (
     load_config,
     loader,
     prepare_data,
+    resolve_path,
     save_checkpoint,
     set_seed,
     skeleton_vocabulary,
@@ -52,6 +53,8 @@ def _run_epoch(
                 if _skeleton_key(skeleton) in skeleton_to_id
             ]
             if not known:
+                if not training:
+                    total += len(batch["skeleton"])
                 continue
             images = batch["image"][known].to(device)
             labels = torch.tensor(
@@ -68,6 +71,8 @@ def _run_epoch(
             total_loss += float(loss.detach()) * labels.numel()
             total_correct += int(logits.argmax(dim=1).eq(labels).sum())
             total += labels.numel()
+            if not training:
+                total += len(batch["skeleton"]) - len(known)
     return total_loss / max(1, total), total_correct / max(1, total)
 
 
@@ -108,12 +113,14 @@ def main() -> None:
         int(data_config["num_workers"]), False,
     )
     validation_loader.collate_fn = stage1_collate
-    output_dir = Path(config["experiment"]["output_dir"]) / "stage1"
-    if not output_dir.is_absolute():
-        output_dir = Path.cwd() / output_dir
+    output_dir = resolve_path(config["experiment"]["output_dir"]) / "stage1"
     output_dir.mkdir(parents=True, exist_ok=True)
     run = start_wandb(config, "stage1-skeleton-classifier")
     best_accuracy = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
+    patience = int(stage_config.get("early_stopping_patience", stage_config["epochs"]))
+    min_delta = float(stage_config.get("early_stopping_min_delta", 0.0))
     try:
         run.log(
             {
@@ -137,8 +144,10 @@ def main() -> None:
             }
             run.log(metrics, step=epoch)
             print(metrics)
-            if validation_accuracy > best_accuracy:
+            if validation_accuracy > best_accuracy + min_delta:
                 best_accuracy = validation_accuracy
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 save_checkpoint(
                     output_dir / "best.pt",
                     model,
@@ -148,7 +157,20 @@ def main() -> None:
                     {"skeleton_to_id": skeleton_to_id, "id_to_skeleton": id_to_skeleton},
                     config,
                 )
-        run.log({"stage1/best_validation_skeleton_accuracy": best_accuracy})
+            else:
+                epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print({"stage1/early_stopping_epoch": epoch, "stage1/best_epoch": best_epoch})
+                break
+        checkpoint = torch.load(output_dir / "best.pt", map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        run.log(
+            {
+                "stage1/best_validation_skeleton_accuracy": best_accuracy,
+                "stage1/best_epoch": best_epoch,
+                "stage1/stopped_epoch": epoch,
+            }
+        )
         import wandb
 
         artifact = wandb.Artifact("stage1-skeleton-classifier", type="model")

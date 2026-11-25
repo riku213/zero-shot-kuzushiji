@@ -821,3 +821,9 @@ python -m src.two_stage.train_stage1 --config configs/two_stage_default.yaml
 python -m src.two_stage.train_stage2 --config configs/two_stage_default.yaml
 python -m src.two_stage.evaluate --config configs/two_stage_default.yaml
 ```
+
+[26/11/25] Stage 1 + Stage 2 unseen-character 本番規模ラン
+
+本番configは`configs/two_stage_m3_full.yaml`。全クラス・全画像を使い、文字単位でtrain/validation/testを分離する（seed 42、0.8/0.1/0.1）。Stage 1/2は各最大100 epoch、validation skeleton accuracy / slot accuracyを監視し、10 epoch連続で改善しなければ停止する。Stage 2は`filled_marker` oracle条件、ImageNet ViT-B/16重みを使う。checkpoint、summary、evaluation JSON、labnote YAML、W&Bローカルログを`outputs/261125_two_stage_m3_full/`以下に保存する。
+
+手動実行用のコピー可能なコマンド（Windows CMD）は[`outputs/261125_two_stage_m3_full/command.md`](outputs/261125_two_stage_m3_full/command.md)に記載した。順序はconda環境有効化、Stage 1学習、Stage 2学習、評価/YAML出力。random splitの比較用設定が必要な場合は、同じconfigの`experiment.split`を`random`へ変更し、`experiment.output_dir`、`tracking.wandb_dir`、`tracking.result_id`、`tracking.result_yaml`を別の出力先/IDに変えて実行する。

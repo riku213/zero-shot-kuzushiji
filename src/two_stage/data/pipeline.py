@@ -215,7 +215,11 @@ def prepare_class_records(
 
 
 def split_records(
-    records: list[dict[str, Any]], train_ratio: float, validation_ratio: float, seed: int
+    records: list[dict[str, Any]],
+    train_ratio: float,
+    validation_ratio: float,
+    seed: int,
+    split_mode: str = "random",
 ) -> dict[str, list[dict[str, Any]]]:
     if train_ratio <= 0 or validation_ratio < 0 or train_ratio + validation_ratio >= 1:
         raise ValueError("Split ratios must satisfy train > 0, validation >= 0, and train + validation < 1.")
@@ -224,6 +228,35 @@ def split_records(
         by_character[record["char"]].append(record)
     rng = random.Random(seed)
     splits = {"train": [], "validation": [], "test": []}
+    if split_mode == "unseen_character":
+        characters = sorted(by_character, key=ord)
+        rng.shuffle(characters)
+        ratios = (train_ratio, validation_ratio, 1.0 - train_ratio - validation_ratio)
+        raw_counts = [len(characters) * ratio for ratio in ratios]
+        class_counts = [int(value) for value in raw_counts]
+        for index in sorted(range(3), key=lambda item: raw_counts[item] - class_counts[item], reverse=True)[
+            : len(characters) - sum(class_counts)
+        ]:
+            class_counts[index] += 1
+        if len(characters) >= 3:
+            for index, ratio in enumerate(ratios):
+                if ratio > 0 and class_counts[index] == 0:
+                    donor = max(range(3), key=lambda candidate: class_counts[candidate])
+                    class_counts[donor] -= 1
+                    class_counts[index] += 1
+        boundaries = (class_counts[0], class_counts[0] + class_counts[1])
+        character_groups = (
+            characters[: boundaries[0]],
+            characters[boundaries[0] : boundaries[1]],
+            characters[boundaries[1] :],
+        )
+        for split_name, group in zip(splits, character_groups):
+            splits[split_name].extend(
+                record for character in group for record in by_character[character]
+            )
+        return splits
+    if split_mode != "random":
+        raise ValueError(f"Unsupported split mode: {split_mode}")
     for character in sorted(by_character, key=ord):
         samples = by_character[character][:]
         rng.shuffle(samples)

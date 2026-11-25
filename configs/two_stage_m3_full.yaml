@@ -1,0 +1,63 @@
+experiment:
+  id: two-stage-m3-full-unseen-261125
+  title: Two-stage Kuzushiji milestone 3 full unseen-character run
+  seed: 42
+  output_dir: outputs/261125_two_stage_m3_full/unseen_character
+  split: unseen_character
+  max_classes: null
+  max_samples_per_class: null
+  train_ratio: 0.8
+  validation_ratio: 0.1
+
+data:
+  root: ../kuzushiji-recognition/char_sep_datas
+  ids_files:
+    - dataset/ids_text/ids.txt
+    - dataset/ids_text/ids-cdp.txt
+  radical_codes: outputs/261018_cos_median_codebook/all_glyph_codes.pkl
+  render_metadata: outputs/261007_correct_dict/combined_render_metadata.json
+  image_root: outputs/261007_correct_dict
+  max_ids_depth: 6
+  image_size: 128
+  num_workers: 4
+
+stage1:
+  enabled: true
+  epochs: 100
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  encoder_channels: [32, 64, 128, 256]
+  dropout: 0.2
+
+stage2:
+  enabled: true
+  input_mode: filled_marker
+  encoder: vit
+  pretrained: true
+  patch_size: 16
+  d_model: 256
+  encoder_layers: 4
+  decoder_layers: 3
+  attention_heads: 8
+  feedforward_dim: 1024
+  dropout: 0.1
+  epochs: 100
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  glyph_code_mode: none
+  guidance_loss_weight: 0.0
+  triplet_loss_weight: 0.0
+
+tracking:
+  wandb_project: zero-shot-kuzushiji
+  wandb_entity: null
+  wandb_mode: online
+  wandb_dir: outputs/261125_two_stage_m3_full/wandb
+  result_id: two-stage-m3-full-unseen-261125
+  result_yaml: outputs/261125_two_stage_m3_full/unseen_character/result_two-stage-m3-full-unseen-261125.yaml

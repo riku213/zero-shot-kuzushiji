@@ -70,7 +70,10 @@ class VisionTransformerEncoder(nn.Module):
                 patch_position = patch_position.permute(0, 2, 3, 1).reshape(1, target_side**2, 768)
             sequence = torch.cat((class_token, patches), dim=1)
             sequence = sequence + torch.cat((class_position, patch_position), dim=1)
-            return self.output_projection(encoder(sequence)[:, 1:])
+            sequence = encoder.dropout(sequence)
+            sequence = encoder.layers(sequence)
+            sequence = encoder.ln(sequence)
+            return self.output_projection(sequence[:, 1:])
         patches = self.patch_embedding(images).flatten(2).transpose(1, 2)
         if patches.shape[1] != self.position_embedding.shape[1]:
             raise ValueError(
