@@ -5,3 +5,5 @@ torchvision
 umap-learn
 fonttools
 matplotlib
+PyYAML
+wandb

@@ -1,0 +1,1 @@
+"""Independent neural models for the two-stage recognition baseline."""
